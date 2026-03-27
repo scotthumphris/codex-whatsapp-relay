@@ -1,0 +1,25 @@
+{
+  "name": "codex-whatsapp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Repo-local Codex plugin for connecting and managing WhatsApp with terminal QR auth and app-server-backed phone control.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "whatsapp:auth": "node ./plugins/whatsapp-relay/scripts/whatsapp-auth.mjs",
+    "whatsapp:controller": "node ./plugins/whatsapp-relay/scripts/controller-daemon.mjs",
+    "whatsapp:mcp": "node ./plugins/whatsapp-relay/scripts/mcp-server.mjs",
+    "whatsapp:status": "node ./plugins/whatsapp-relay/scripts/whatsapp-status.mjs",
+    "check": "node --check ./plugins/whatsapp-relay/scripts/*.mjs"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "pino": "^9.9.4",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.1.11"
+  }
+}

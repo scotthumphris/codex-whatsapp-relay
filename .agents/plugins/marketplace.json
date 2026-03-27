@@ -1,0 +1,20 @@
+{
+  "name": "whatsapp-relay",
+  "interface": {
+    "displayName": "WhatsApp Relay"
+  },
+  "plugins": [
+    {
+      "name": "whatsapp-relay",
+      "source": {
+        "source": "local",
+        "path": "./plugins/whatsapp-relay"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
