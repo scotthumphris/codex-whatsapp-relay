@@ -59,6 +59,7 @@ async function runCommand(command, args, { timeoutMs, cwd } = {}) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let closed = false;
     let timeout = null;
 
     if (timeoutMs) {
@@ -66,7 +67,7 @@ async function runCommand(command, args, { timeoutMs, cwd } = {}) {
         timedOut = true;
         child.kill("SIGTERM");
         setTimeout(() => {
-          if (!child.killed) {
+          if (!closed && child.exitCode === null && child.signalCode === null) {
             child.kill("SIGKILL");
           }
         }, 250).unref();
@@ -90,6 +91,7 @@ async function runCommand(command, args, { timeoutMs, cwd } = {}) {
     });
 
     child.on("close", (code, signal) => {
+      closed = true;
       if (timeout) {
         clearTimeout(timeout);
       }
