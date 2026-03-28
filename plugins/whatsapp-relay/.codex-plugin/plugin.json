@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Link a local WhatsApp account to Codex, manage chats, and control Codex from allowed WhatsApp numbers.",
   "author": {
     "name": "Adolfo Builes",

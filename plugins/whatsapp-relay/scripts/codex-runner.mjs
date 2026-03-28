@@ -10,7 +10,7 @@ import {
 const CLIENT_INFO = {
   name: "whatsapp-relay",
   title: "WhatsApp Relay",
-  version: "0.1.0"
+  version: "0.2.0"
 };
 
 const OPT_OUT_NOTIFICATIONS = [
