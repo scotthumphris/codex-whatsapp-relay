@@ -2,17 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  isSupportedInboundTextMessageType,
   normalizeVoiceCommandText,
   parseVoiceTranscript
 } from "./controller-bridge.mjs";
-
-test("isSupportedInboundTextMessageType only accepts textual WhatsApp message types", () => {
-  assert.equal(isSupportedInboundTextMessageType("conversation"), true);
-  assert.equal(isSupportedInboundTextMessageType("extendedTextMessage"), true);
-  assert.equal(isSupportedInboundTextMessageType("audioMessage"), false);
-  assert.equal(isSupportedInboundTextMessageType("imageMessage"), false);
-});
 
 test("normalizeVoiceCommandText removes accents and punctuation", () => {
   assert.equal(

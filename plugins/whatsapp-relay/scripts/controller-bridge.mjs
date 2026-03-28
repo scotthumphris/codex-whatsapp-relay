@@ -28,14 +28,6 @@ const OUTBOX_POLL_MS = 1_000;
 const SESSION_LIST_LIMIT = 12;
 const SESSION_CONNECT_SEARCH_LIMIT = 50;
 const DANGER_CONFIRMATION_WINDOW_MS = 60_000;
-const SUPPORTED_INBOUND_TEXT_MESSAGE_TYPES = new Set([
-  "conversation",
-  "extendedTextMessage",
-  "buttonsResponseMessage",
-  "listResponseMessage",
-  "templateButtonReplyMessage"
-]);
-
 function normalizeTimestamp(value) {
   if (value === undefined || value === null) {
     return null;
@@ -94,10 +86,6 @@ function splitMessage(text, limit = MAX_WHATSAPP_MESSAGE) {
   }
 
   return parts;
-}
-
-export function isSupportedInboundTextMessageType(messageType) {
-  return SUPPORTED_INBOUND_TEXT_MESSAGE_TYPES.has(String(messageType ?? ""));
 }
 
 function shortThreadId(threadId) {
@@ -688,7 +676,7 @@ export class WhatsAppControllerBridge {
     const messageType = extractMessageType(message.message);
     const audioMessage = extractAudioMessage(message.message);
     const extractedText = extractMessageText(message.message).trim();
-    let text = isSupportedInboundTextMessageType(messageType) ? extractedText : "";
+    let text = audioMessage ? "" : extractedText;
     const session = this.stateStore.data.sessions[phoneKey] ?? {};
     const label = controller.label ?? message.pushName ?? null;
 
@@ -706,7 +694,7 @@ export class WhatsAppControllerBridge {
 
     let command = null;
 
-    if (text && isSupportedInboundTextMessageType(messageType)) {
+    if (text) {
       command = parseIncomingCommand(text, config.captureAllDirectMessages);
     } else if (audioMessage) {
       await this.sendReply(
