@@ -17,6 +17,10 @@ test("parseVoiceTranscript maps exact spoken control commands conservatively", (
   assert.deepEqual(parseVoiceTranscript("Ayuda"), { type: "help" });
   assert.deepEqual(parseVoiceTranscript("estado"), { type: "status" });
   assert.deepEqual(parseVoiceTranscript("detente"), { type: "stop" });
+  assert.deepEqual(parseVoiceTranscript("cancelar"), {
+    type: "approvalDecision",
+    decision: "cancel"
+  });
   assert.deepEqual(parseVoiceTranscript("nueva sesión"), { type: "new", prompt: "" });
   assert.deepEqual(parseVoiceTranscript("please fix the checkout button"), {
     type: "prompt",

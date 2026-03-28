@@ -232,9 +232,16 @@ export function parseVoiceTranscript(transcript, captureAllDirectMessages = true
 
   if (
     matchesVoiceCommand(normalized, [
-      "stop",
       "cancel",
-      "cancelar",
+      "cancelar"
+    ])
+  ) {
+    return { type: "approvalDecision", decision: "cancel" };
+  }
+
+  if (
+    matchesVoiceCommand(normalized, [
+      "stop",
       "para",
       "parar",
       "deten",
