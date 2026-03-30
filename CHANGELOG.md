@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `/voice on` and `/voice off` can now be changed while a Codex run is still active, and in-flight replies honor the updated voice mode instead of the stale run-start setting.
+
 ## [0.4.2] - 2026-03-29
 
 ### Added

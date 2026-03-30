@@ -352,15 +352,28 @@ function helpText() {
 }
 
 function resolveSessionVoiceReply(session = {}) {
-  const reply = session.voiceReply ?? {};
   return {
-    enabled: reply.enabled === true,
-    speed: normalizeVoiceReplySpeed(reply.speed, DEFAULT_VOICE_REPLY_SPEED)
+    enabled: session.voiceReply?.enabled === true,
+    speed: normalizeVoiceReplySpeed(
+      session.voiceReply?.speed,
+      DEFAULT_VOICE_REPLY_SPEED
+    )
   };
 }
 
 function formatVoiceReplySummary(voiceReply) {
   return voiceReply.enabled ? `on (${voiceReply.speed})` : "off";
+}
+
+function cloneVoiceReplySetting(voiceReply = {}) {
+  return {
+    enabled: voiceReply?.enabled === true,
+    speed: normalizeVoiceReplySpeed(voiceReply?.speed, DEFAULT_VOICE_REPLY_SPEED)
+  };
+}
+
+export function resolveRunVoiceReply(activeRun, fallbackVoiceReply = null) {
+  return cloneVoiceReplySetting(activeRun?.voiceReply ?? fallbackVoiceReply ?? {});
 }
 
 function resolveConfiguredTtsProvider(config) {
@@ -1449,6 +1462,24 @@ export class WhatsAppControllerBridge {
           : null;
       })
       .filter(Boolean);
+  }
+
+  updateActiveRunVoiceReplySettings(phoneKey, voiceReply) {
+    const nextVoiceReply = cloneVoiceReplySetting(voiceReply);
+    let updatedRuns = 0;
+
+    for (const { run } of this.activeProjectRuns(phoneKey)) {
+      run.voiceReply = nextVoiceReply;
+      updatedRuns += 1;
+    }
+
+    const btwRun = this.btwRun(phoneKey);
+    if (btwRun) {
+      btwRun.voiceReply = nextVoiceReply;
+      updatedRuns += 1;
+    }
+
+    return updatedRuns;
   }
 
   getQueuedPrompts(phoneKey, { scopeType = "project", projectAlias = null } = {}) {
@@ -2861,16 +2892,6 @@ export class WhatsAppControllerBridge {
   }
 
   async handleVoiceReplyCommand({ phoneKey, remoteJid, payload, label }) {
-    const activeCount =
-      this.activeProjectRuns(phoneKey).length + (this.btwRun(phoneKey) ? 1 : 0);
-    if (activeCount) {
-      await this.sendReply(
-        remoteJid,
-        "Wait for the active Codex run to finish or send /stop before changing voice reply mode."
-      );
-      return;
-    }
-
     const session = this.getChatSession(phoneKey);
     const currentVoiceReply = resolveSessionVoiceReply(session);
     const parsed = parseVoiceReplyCommandPayload(payload);
@@ -2895,7 +2916,13 @@ export class WhatsAppControllerBridge {
         label,
         voiceReply: nextVoiceReply
       });
-      await this.sendReply(remoteJid, "Voice replies are now off for this chat.");
+      const updatedRuns = this.updateActiveRunVoiceReplySettings(phoneKey, nextVoiceReply);
+      await this.sendReply(
+        remoteJid,
+        updatedRuns
+          ? "Voice replies are now off for this chat. Active runs will finish with text replies."
+          : "Voice replies are now off for this chat."
+      );
       return;
     }
 
@@ -2911,9 +2938,12 @@ export class WhatsAppControllerBridge {
         label,
         voiceReply: nextVoiceReply
       });
+      const updatedRuns = this.updateActiveRunVoiceReplySettings(phoneKey, nextVoiceReply);
       await this.sendReply(
         remoteJid,
-        `Voice replies are now on for this chat at ${nextVoiceReply.speed}.`
+        updatedRuns
+          ? `Voice replies are now on for this chat at ${nextVoiceReply.speed}. Active runs will use the new voice setting.`
+          : `Voice replies are now on for this chat at ${nextVoiceReply.speed}.`
       );
       return;
     }
@@ -3392,7 +3422,7 @@ export class WhatsAppControllerBridge {
       lastProgressAt: null,
       progressPhase: null,
       progressPreview: null,
-      voiceReply: activeVoiceReply,
+      voiceReply: cloneVoiceReplySetting(activeVoiceReply),
       scopeType,
       projectAlias: scopeType === "project" ? project.alias : null
     };
@@ -3444,6 +3474,7 @@ export class WhatsAppControllerBridge {
     try {
       const result = await resultPromise;
       this.activeRuns.delete(runKey);
+      const currentVoiceReply = resolveRunVoiceReply(activeRun, activeVoiceReply);
       const replyEnvelope = extractVoiceReplyEnvelope(result.replyText);
       const replyText =
         replyEnvelope.text || (replyEnvelope.hasLanguageTag ? "" : result.replyText);
@@ -3464,7 +3495,7 @@ export class WhatsAppControllerBridge {
             pendingApproval: null,
             lastReplyAt: new Date().toISOString(),
             lastReplyPreview: replyText.slice(0, 200),
-            lastReplyVoiceReply: activeVoiceReply.enabled ? activeVoiceReply : null
+            lastReplyVoiceReply: currentVoiceReply.enabled ? currentVoiceReply : null
           }
         });
       } else {
@@ -3480,7 +3511,7 @@ export class WhatsAppControllerBridge {
         });
       }
 
-      if (activeVoiceReply.enabled) {
+      if (currentVoiceReply.enabled) {
         try {
           const activeProjectNow = this.getActiveProject(phoneKey);
           if (scopeType === "project" && activeProjectNow.alias !== project.alias) {
@@ -3496,7 +3527,7 @@ export class WhatsAppControllerBridge {
           await this.sendVoiceReply(
             remoteJid,
             replyText,
-            activeVoiceReply,
+            currentVoiceReply,
             replyEnvelope.languageId
           );
           const textCompanion = buildVoiceReplyTextCompanion(replyText);

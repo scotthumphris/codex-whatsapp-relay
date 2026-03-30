@@ -21,6 +21,7 @@ import {
   parseVoiceTranscript,
   requiresTextConfirmationForVoicePrompt,
   resolveProjectSelection,
+  resolveRunVoiceReply,
   resolveThreadSelection,
   sanitizeReplyTextForWhatsApp,
   shouldSplitCompoundVoiceControlRequest
@@ -613,6 +614,96 @@ test("parseVoiceReplyCommandPayload parses status and speed controls", () => {
     speed: "2x"
   });
   assert.deepEqual(parseVoiceReplyCommandPayload("off"), { action: "off" });
+});
+
+test("resolveRunVoiceReply prefers the latest active-run voice setting", () => {
+  assert.deepEqual(
+    resolveRunVoiceReply(
+      {
+        voiceReply: {
+          enabled: false,
+          speed: "1x"
+        }
+      },
+      {
+        enabled: true,
+        speed: "2x"
+      }
+    ),
+    {
+      enabled: false,
+      speed: "1x"
+    }
+  );
+});
+
+test("handleVoiceReplyCommand updates active runs without requiring /stop", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "voice-mode-test-"));
+  const filePath = path.join(tempDir, "controller-state.json");
+
+  try {
+    const stateStore = new ControllerStateStore(filePath);
+    await stateStore.load();
+    await stateStore.upsertSession("123", {
+      phoneKey: "123",
+      activeProject: "alpha-app",
+      remoteJid: "123@s.whatsapp.net",
+      label: "Test User",
+      voiceReply: {
+        enabled: false,
+        speed: "1x"
+      },
+      projects: {
+        "alpha-app": {
+          threadId: "thread-backend"
+        }
+      }
+    });
+
+    const bridge = new WhatsAppControllerBridge({
+      runtime: {},
+      configStore: {
+        data: {
+          defaultProject: "alpha-app",
+          permissionLevel: "workspace-write"
+        }
+      },
+      stateStore
+    });
+
+    const replies = [];
+    bridge.sendReply = async (_remoteJid, text) => {
+      replies.push(text);
+    };
+    bridge.activeRuns.set("project:123:alpha-app", {
+      voiceReply: {
+        enabled: false,
+        speed: "1x"
+      }
+    });
+
+    await bridge.handleVoiceReplyCommand({
+      phoneKey: "123",
+      remoteJid: "123@s.whatsapp.net",
+      payload: "on 2x",
+      label: "Test User"
+    });
+
+    assert.deepEqual(stateStore.getSession("123").voiceReply, {
+      enabled: true,
+      speed: "2x"
+    });
+    assert.deepEqual(bridge.projectRun("123", "alpha-app").voiceReply, {
+      enabled: true,
+      speed: "2x"
+    });
+    assert.equal(
+      replies[0],
+      "Voice replies are now on for this chat at 2x. Active runs will use the new voice setting."
+    );
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("extractOneShotVoiceReplyRequest pulls a one-off spoken reply directive out of text", () => {
