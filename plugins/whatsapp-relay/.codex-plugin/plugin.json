@@ -1,13 +1,13 @@
 {
   "name": "whatsapp-relay",
-  "version": "0.2.0",
+  "version": "0.4.3",
   "description": "Link a local WhatsApp account to Codex, manage chats, and control Codex from allowed WhatsApp numbers.",
   "author": {
     "name": "Adolfo Builes",
     "url": "https://github.com/abuiles"
   },
-  "homepage": "https://github.com/abuiles/codex-whatsapp-relay-plugin",
-  "repository": "https://github.com/abuiles/codex-whatsapp-relay-plugin",
+  "homepage": "https://github.com/abuiles/codex-whatsapp-relay",
+  "repository": "https://github.com/abuiles/codex-whatsapp-relay",
   "license": "MIT",
   "keywords": [
     "whatsapp",
