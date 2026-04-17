@@ -19,15 +19,11 @@ const CLIENT_INFO = {
 const OPT_OUT_NOTIFICATIONS = [
   "account/rateLimits/updated",
   "command/exec/outputDelta",
-  "item/commandExecution/outputDelta",
   "item/commandExecution/terminalInteraction",
   "item/fileChange/outputDelta",
   "item/plan/delta",
   "item/reasoning/summaryPartAdded",
-  "item/reasoning/summaryTextDelta",
   "item/reasoning/textDelta",
-  "mcpServer/startupStatus/updated",
-  "thread/status/changed",
   "thread/tokenUsage/updated"
 ];
 const VOICE_COMMAND_INTENT_MODEL = "gpt-5.4-mini";
@@ -406,6 +402,32 @@ export function normalizeCodexTurnNotification(
         };
       }
       return null;
+    case "item/commandExecution/outputDelta":
+      if (params.turnId !== activeTurnId) {
+        return null;
+      }
+      return {
+        type: "toolProgress",
+        turnId: params.turnId,
+        itemId: params.itemId ?? params.item?.id ?? null,
+        itemType: "commandExecution",
+        text:
+          params.delta ??
+          params.outputDelta ??
+          params.output ??
+          params.text ??
+          ""
+      };
+    case "item/reasoning/summaryTextDelta":
+      if (params.turnId !== activeTurnId) {
+        return null;
+      }
+      return {
+        type: "reasoningProgress",
+        turnId: params.turnId,
+        itemId: params.itemId ?? params.item?.id ?? null,
+        text: params.delta ?? params.text ?? ""
+      };
     case "item/completed":
       if (params.turnId !== activeTurnId || !params.item?.id) {
         return null;
@@ -443,6 +465,38 @@ export function normalizeCodexTurnNotification(
         };
       }
       return null;
+    case "thread/status/changed": {
+      const threadId = params.thread?.id ?? params.threadId ?? null;
+      if (threadId !== resolvedThreadId) {
+        return null;
+      }
+      return {
+        type: "threadStatusChanged",
+        threadId,
+        status: params.thread?.status ?? params.status ?? null
+      };
+    }
+    case "mcpServer/startupStatus/updated":
+      return {
+        type: "mcpServerStatus",
+        threadId: params.threadId ?? null,
+        serverName:
+          params.serverName ??
+          params.name ??
+          params.server?.name ??
+          params.id ??
+          "MCP server",
+        status:
+          params.status ??
+          params.startupStatus ??
+          params.server?.status ??
+          null,
+        detail:
+          params.message ??
+          params.detail ??
+          params.server?.message ??
+          null
+      };
     case "turn/completed":
       if (params.turn?.id === activeTurnId) {
         return {
@@ -1156,6 +1210,12 @@ export function startCodexTurn({
           phase: event.phase ?? null,
           text: event.text ?? ""
         });
+        onLifecycleEvent?.(event);
+        return;
+      case "toolProgress":
+      case "reasoningProgress":
+      case "threadStatusChanged":
+      case "mcpServerStatus":
         onLifecycleEvent?.(event);
         return;
       case "approvalResolved":

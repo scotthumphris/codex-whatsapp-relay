@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { ControllerConfigStore } from "./controller-config.mjs";
 import { getGlobalControllerOwner } from "./controller-owner.mjs";
+import { isControllerPidRunning } from "./controller-process-check.mjs";
 import { ControllerStateStore } from "./controller-state.mjs";
 import {
   controllerDaemonScript,
@@ -12,19 +13,6 @@ import {
   controllerLogFile,
   repoRoot
 } from "./paths.mjs";
-
-function isPidRunning(pid) {
-  if (!pid) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 export function controllerDaemonEnv(config = {}, baseEnv = process.env) {
   return {
@@ -39,7 +27,7 @@ export async function getControllerProcessStatus() {
   const stateStore = new ControllerStateStore();
   await stateStore.load();
   const processState = stateStore.data.process;
-  const running = isPidRunning(processState.pid);
+  const running = isControllerPidRunning(processState.pid);
 
   if (!running && processState.pid) {
     await stateStore.clearProcess();

@@ -351,6 +351,43 @@ test("applyRunLifecycleEvent tracks active tool calls separately from agent mess
   assert.equal(activeRun.toolWaitStartedAt, null);
 });
 
+test("applyRunLifecycleEvent uses selected native progress signals for previews", () => {
+  const activeRun = {
+    status: "running",
+    progressPreview: null,
+    lastProgressAt: null,
+    activeToolItems: new Map(),
+    toolWaitStartedAt: null
+  };
+
+  applyRunLifecycleEvent(
+    activeRun,
+    {
+      type: "itemStarted",
+      itemId: "tool-1",
+      itemType: "functionCall",
+      title: "mcp__codex_apps__google_calendar_create_event"
+    },
+    "2026-03-30T10:00:04.000Z"
+  );
+  assert.equal(activeRun.progressPreview, "Started Google Calendar create event.");
+
+  applyRunLifecycleEvent(
+    activeRun,
+    {
+      type: "mcpServerStatus",
+      serverName: "google-calendar",
+      status: "starting",
+      detail: "Initializing connector"
+    },
+    "2026-03-30T10:00:06.000Z"
+  );
+  assert.equal(
+    activeRun.progressPreview,
+    "google-calendar: status starting: Initializing connector"
+  );
+});
+
 test("classifyRunStall extends bulk runs that are still inside an active tool call", () => {
   const startedAt = Date.parse("2026-03-30T10:00:00.000Z");
   const nowMs = startedAt + 11 * 60_000;
@@ -370,6 +407,38 @@ test("classifyRunStall extends bulk runs that are still inside an active tool ca
     action: "extend",
     reason: "activeToolCall",
     toolWaitMs: 10 * 60_000
+  });
+});
+
+test("classifyRunStall stops a normal run when a tool call appears hung", () => {
+  const startedAt = Date.parse("2026-03-30T10:00:00.000Z");
+  const nowMs = startedAt + 11 * 60_000;
+  const activeRun = {
+    isBulkRun: false,
+    pendingApproval: null,
+    startedAtMs: startedAt,
+    lastEventAt: "2026-03-30T10:00:30.000Z",
+    lastProgressAt: "2026-03-30T10:00:30.000Z",
+    activeToolItems: new Map([
+      [
+        "tool-1",
+        {
+          itemType: "functionCall",
+          title: "mcp__codex_apps__google_calendar_create_event",
+          startedAt: "2026-03-30T10:01:00.000Z"
+        }
+      ]
+    ]),
+    toolWaitStartedAt: "2026-03-30T10:01:00.000Z"
+  };
+
+  assert.deepEqual(classifyRunStall(activeRun, nowMs), {
+    action: "stop",
+    reason: "toolHang",
+    toolWaitMs: 10 * 60_000,
+    toolHangTimeoutMs: 10 * 60_000,
+    toolTitle: "mcp__codex_apps__google_calendar_create_event",
+    itemType: "functionCall"
   });
 });
 
@@ -560,6 +629,59 @@ test("renderSessionStatus includes queued message counts for project and btw sco
 
   assert.match(bridge.renderSessionStatus("123"), /queued_messages: 2/);
   assert.match(bridge.renderSessionStatus("123", "btw"), /queued_messages: 1/);
+});
+
+test("handleRunStallWarning flushes buffered progress before generic waiting text", async () => {
+  const sentReplies = [];
+  const bridge = new WhatsAppControllerBridge({
+    runtime: {},
+    configStore: {
+      data: {
+        defaultProject: "assistant",
+        permissionLevel: "workspace-write",
+        projects: [{ alias: "assistant", workspace: "/workspace/assistant" }]
+      }
+    },
+    stateStore: {
+      data: { process: {} },
+      getSession() {
+        return {
+          activeProject: "assistant",
+          projects: { assistant: {} }
+        };
+      }
+    }
+  });
+
+  bridge.sendReply = async (_jid, text) => {
+    sentReplies.push(text);
+  };
+
+  const runKey = "project:447495299872:assistant";
+  bridge.activeRuns.set(runKey, {
+    cancelled: false,
+    pendingApproval: null,
+    stallWarningSent: false,
+    remoteJid: "447495299872@s.whatsapp.net",
+    scopeType: "project",
+    projectAlias: "assistant",
+    progressPreview:
+      "Test plan: 1 private 5-minute event, no attendees, then delete it immediately if creation succeeds.",
+    lastProgressSentPreview: null,
+    lastProgressSentAt: null,
+    sendingProgressUpdate: false,
+    progressPhase: "commentary",
+    isBulkRun: false,
+    activeToolItems: new Map([
+      ["tool-1", { title: "mcp__codex_apps__google_calendar_create_event", startedAt: "2026-03-30T10:00:00.000Z" }]
+    ])
+  });
+
+  await bridge.handleRunStallWarning(runKey);
+
+  assert.equal(sentReplies.length, 1);
+  assert.match(sentReplies[0], /Working update:/);
+  assert.match(sentReplies[0], /Test plan:/);
 });
 
 test("processStartupBacklog ignores stale cached messages", async () => {

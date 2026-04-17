@@ -11,6 +11,8 @@ import {
   releaseGlobalControllerOwner
 } from "./controller-owner.mjs";
 
+const isPidRunning = (pid) => pid === process.pid;
+
 async function withTempOwnerFile(run) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "controller-owner-"));
   const ownerFile = path.join(tempDir, "owner.json");
@@ -29,7 +31,8 @@ test("claimGlobalControllerOwner prevents a second live owner from taking over",
         repoRootPath: "/repo/first",
         pluginRootPath: "/plugin/first"
       },
-      ownerFile
+      ownerFile,
+      { isPidRunning }
     );
     assert.equal(initial.acquired, true);
 
@@ -39,7 +42,8 @@ test("claimGlobalControllerOwner prevents a second live owner from taking over",
         repoRootPath: "/repo/second",
         pluginRootPath: "/plugin/second"
       },
-      ownerFile
+      ownerFile,
+      { isPidRunning }
     );
 
     assert.equal(blocked.acquired, false);
@@ -65,12 +69,16 @@ test("claimGlobalControllerOwner clears stale owners before granting a new claim
         repoRootPath: "/repo/current",
         pluginRootPath: "/plugin/current"
       },
-      ownerFile
+      ownerFile,
+      { isPidRunning }
     );
 
     assert.equal(claimed.acquired, true);
     assert.equal(claimed.owner.repoRoot, "/repo/current");
-    assert.equal((await getGlobalControllerOwner(ownerFile))?.pid, process.pid);
+    assert.equal(
+      (await getGlobalControllerOwner(ownerFile, { isPidRunning }))?.pid,
+      process.pid
+    );
   });
 });
 
@@ -82,16 +90,27 @@ test("releaseGlobalControllerOwner only removes the lock for the owner pid", asy
         repoRootPath: "/repo/current",
         pluginRootPath: "/plugin/current"
       },
-      ownerFile
+      ownerFile,
+      { isPidRunning }
     );
 
     assert.equal(
-      await releaseGlobalControllerOwner({ pid: process.pid + 100_000 }, ownerFile),
+      await releaseGlobalControllerOwner(
+        { pid: process.pid + 100_000 },
+        ownerFile,
+        { isPidRunning }
+      ),
       false
     );
-    assert.equal((await getGlobalControllerOwner(ownerFile))?.pid, process.pid);
+    assert.equal(
+      (await getGlobalControllerOwner(ownerFile, { isPidRunning }))?.pid,
+      process.pid
+    );
 
-    assert.equal(await releaseGlobalControllerOwner({ pid: process.pid }, ownerFile), true);
-    assert.equal(await getGlobalControllerOwner(ownerFile), null);
+    assert.equal(
+      await releaseGlobalControllerOwner({ pid: process.pid }, ownerFile, { isPidRunning }),
+      true
+    );
+    assert.equal(await getGlobalControllerOwner(ownerFile, { isPidRunning }), null);
   });
 });

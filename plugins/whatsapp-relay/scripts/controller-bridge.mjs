@@ -42,12 +42,14 @@ import {
 
 const MAX_WHATSAPP_MESSAGE = 3500;
 const HEARTBEAT_MS = 30_000;
-const RUN_STALL_TIMEOUT_MS = 90_000;
-const BULK_RUN_STALL_TIMEOUT_MS = 120_000;
-const STALL_WARNING_LEAD_MS = 60_000;
+const RUN_STALL_TIMEOUT_MS = 2 * 60_000;
+const BULK_RUN_STALL_TIMEOUT_MS = 2 * 60_000;
+const STALL_WARNING_LEAD_MS = 0;
 const STALL_RACE_GRACE_MS = 15_000;
 const RUN_HARD_TIMEOUT_MS = 2 * 60 * 60_000;
 const BULK_RUN_HARD_TIMEOUT_MS = 4 * 60 * 60_000;
+const TOOL_CALL_HANG_TIMEOUT_MS = 10 * 60_000;
+const BULK_TOOL_CALL_HANG_TIMEOUT_MS = 20 * 60_000;
 const BULK_PROGRESS_EXTENSION_WINDOW_MS = 2 * 60_000;
 const RECENT_MESSAGE_LIMIT = 500;
 const OUTBOX_POLL_MS = 1_000;
@@ -58,7 +60,7 @@ const DANGER_CONFIRMATION_WINDOW_MS = 60_000;
 const ACTIVE_RUN_PREVIEW_LIMIT = 160;
 const LONG_RUN_PROGRESS_DELAY_MS = 45_000;
 const BULK_RUN_PROGRESS_DELAY_MS = 15_000;
-const MIN_PROGRESS_UPDATE_INTERVAL_MS = 30_000;
+const MIN_PROGRESS_UPDATE_INTERVAL_MS = 2 * 60_000;
 const VOICE_REPLY_SPEEDS = new Set(["1x", "2x"]);
 const LOGGED_OUT_RECOVERY_MS = 60_000;
 const STARTUP_BACKLOG_LIMIT = 10;
@@ -201,6 +203,36 @@ function compactRunPreview(value, limit = ACTIVE_RUN_PREVIEW_LIMIT) {
   return text ? text.slice(0, limit) : null;
 }
 
+function stringifyLifecycleValue(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  if (typeof value === "object") {
+    for (const key of ["status", "state", "phase", "type", "value", "label", "name"]) {
+      if (typeof value[key] === "string" && value[key].trim()) {
+        return value[key];
+      }
+    }
+
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return null;
+    }
+  }
+
+  return String(value);
+}
+
 function timestampToMs(value) {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -216,6 +248,151 @@ function timestampToMs(value) {
 
 function stripAnsi(value) {
   return String(value ?? "").replace(ANSI_ESCAPE_PATTERN, "");
+}
+
+function describeActiveToolForUser(toolTitle) {
+  const raw = String(toolTitle ?? "").trim();
+  if (!raw) {
+    return "current tool call";
+  }
+
+  const normalized = raw
+    .replace(/^mcp__[^_]+__/, "")
+    .replace(/^mcp__/, "")
+    .replace(/^codex_apps__/, "")
+    .replace(/^google_calendar_/, "Google Calendar ")
+    .replace(/^gmail_/, "Gmail ")
+    .replace(/^outlook_email_/, "Outlook Email ")
+    .replace(/^outlook_calendar_/, "Outlook Calendar ")
+    .replace(/^google_drive_/, "Google Drive ")
+    .replace(/^google_docs_/, "Google Docs ")
+    .replace(/^google_sheets_/, "Google Sheets ")
+    .replace(/^google_slides_/, "Google Slides ")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return normalized || raw;
+}
+
+function buildActiveToolWaitMessage(activeRun, {
+  prefix = "Working update",
+  includeWaitingTail = true,
+  bulkWaitingTail = "No new batch is confirmed yet."
+} = {}) {
+  const oldestTool = getOldestActiveToolItem(activeRun);
+  const toolLabel = describeActiveToolForUser(oldestTool?.title);
+  const body = activeRun?.isBulkRun
+    ? `Still waiting for ${toolLabel} to return. ${includeWaitingTail ? bulkWaitingTail : ""}`.trim()
+    : `Still waiting for ${toolLabel} to return.${includeWaitingTail ? "" : ""}`;
+  return `${prefix}:\n${body}`;
+}
+
+function buildLifecycleObservationPreview(event, activeRun) {
+  switch (event?.type) {
+    case "toolProgress": {
+      const text = compactRunPreview(event.text);
+      return text ? `Tool output: ${text}` : null;
+    }
+    case "reasoningProgress": {
+      const text = compactRunPreview(event.text);
+      return text ? `Reasoning update: ${text}` : null;
+    }
+    case "mcpServerStatus": {
+      const serverName = compactRunPreview(event.serverName ?? "MCP server", 60);
+      const status = compactRunPreview(event.status ?? "", 40);
+      const detail = compactRunPreview(event.detail ?? "", 100);
+      return compactRunPreview(
+        [serverName, status ? `status ${status}` : null, detail].filter(Boolean).join(": ")
+      );
+    }
+    case "itemStarted": {
+      const toolLabel = describeActiveToolForUser(event.title);
+      return toolLabel ? `Started ${toolLabel}.` : null;
+    }
+    case "threadStatusChanged": {
+      const status = compactRunPreview(stringifyLifecycleValue(event.status) ?? "", 80);
+      return status ? `Thread status: ${status}` : null;
+    }
+    default:
+      return null;
+  }
+}
+
+function lifecyclePreviewPriority(eventType) {
+  switch (eventType) {
+    case "agentMessageStarted":
+    case "agentMessageDelta":
+    case "agentMessageCompleted":
+      return 4;
+    case "toolProgress":
+    case "reasoningProgress":
+      return 3;
+    case "itemStarted":
+    case "itemCompleted":
+    case "mcpServerStatus":
+      return 2;
+    case "threadStatusChanged":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function maybeSetRunPreview(activeRun, eventType, preview, timestamp) {
+  if (!preview) {
+    return;
+  }
+
+  const nextPriority = lifecyclePreviewPriority(eventType);
+  const currentPriority =
+    Number.isFinite(activeRun.progressPreviewPriority) ? activeRun.progressPreviewPriority : 0;
+
+  if (nextPriority < currentPriority) {
+    return;
+  }
+
+  activeRun.progressPreview = preview;
+  activeRun.progressPreviewPriority = nextPriority;
+  activeRun.lastProgressAt = timestamp;
+}
+
+function getOldestActiveToolItem(activeRun) {
+  const activeToolItems =
+    activeRun?.activeToolItems instanceof Map ? activeRun.activeToolItems : new Map();
+  let oldest = null;
+  for (const entry of activeToolItems.values()) {
+    const startedAtMs = timestampToMs(entry?.startedAt);
+    if (!oldest) {
+      oldest = { ...entry, startedAtMs };
+      continue;
+    }
+
+    if (
+      Number.isFinite(startedAtMs) &&
+      (!Number.isFinite(oldest.startedAtMs) || startedAtMs < oldest.startedAtMs)
+    ) {
+      oldest = { ...entry, startedAtMs };
+    }
+  }
+
+  return oldest;
+}
+
+function buildTimedOutFailureMessage(activeRun) {
+  const timeoutDetails = activeRun?.timeoutDetails ?? null;
+  if (timeoutDetails?.reason === "toolHang") {
+    const toolLabel = describeActiveToolForUser(timeoutDetails.toolTitle);
+    const durationMinutes = Math.max(1, Math.round((timeoutDetails.toolWaitMs ?? 0) / 60_000));
+    return [
+      `Codex stopped because the ${toolLabel} call appeared hung for about ${durationMinutes} minute${
+        durationMinutes === 1 ? "" : "s"
+      }.`,
+      "The tool never returned a completed result, so the outcome is unknown."
+    ].join(" ");
+  }
+
+  return "Codex run stalled while waiting for a tool response and was stopped.";
 }
 
 function buildRecentMessageKey(chatId, messageId) {
@@ -251,6 +428,53 @@ function looksLikeBulkOperationPrompt(prompt) {
     /\bmailbox\b/,
     /\bgmail\b/
   ].some((pattern) => pattern.test(normalized));
+}
+
+function looksLikeIsolatedConnectorWritePrompt(prompt) {
+  const normalized = String(prompt ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  const connectorMentioned = [
+    /\bgoogle calendar\b/,
+    /\bgmail\b/,
+    /\boutlook calendar\b/,
+    /\boutlook email\b/,
+    /\bcalendar\b/,
+    /\binbox\b/,
+    /\bmailbox\b/
+  ].some((pattern) => pattern.test(normalized));
+
+  const writeIntent = [
+    /\bwrite\b/,
+    /\bcreate\b/,
+    /\bdelete\b/,
+    /\bupdate\b/,
+    /\brename\b/,
+    /\bmove\b/,
+    /\barchive\b/,
+    /\blabel\b/,
+    /\bsend\b/,
+    /\bschedule\b/,
+    /\breschedule\b/,
+    /\bcancel\b/,
+    /\bcleanup\b/,
+    /\bclean up\b/,
+    /\btest\b/,
+    /\bcanary\b/
+  ].some((pattern) => pattern.test(normalized));
+
+  return connectorMentioned && writeIntent;
+}
+
+function buildWorkerThreadName(baseName) {
+  const normalized = String(baseName ?? "").trim();
+  if (!normalized) {
+    return "WhatsApp Worker";
+  }
+
+  return `${normalized} [worker]`.slice(0, 120);
 }
 
 export function buildControllerRunPrompt(prompt) {
@@ -365,6 +589,23 @@ function shouldSendRunProgressUpdate(activeRun, nowMs = Date.now()) {
   return activeRun.progressPreview !== activeRun.lastProgressSentPreview;
 }
 
+function shouldFlushBufferedProgressUpdate(activeRun, nowMs = Date.now()) {
+  if (!activeRun?.progressPreview || activeRun.pendingApproval) {
+    return false;
+  }
+
+  if (activeRun.progressPhase === "final_answer") {
+    return false;
+  }
+
+  const lastSentAtMs = Date.parse(activeRun.lastProgressSentAt ?? "");
+  if (Number.isFinite(lastSentAtMs) && nowMs - lastSentAtMs < MIN_PROGRESS_UPDATE_INTERVAL_MS) {
+    return false;
+  }
+
+  return activeRun.progressPreview !== activeRun.lastProgressSentPreview;
+}
+
 function formatRunProgressUpdate({
   scopeType = "project",
   projectAlias = null,
@@ -400,10 +641,17 @@ export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().
       activeRun.status = event.phase === "final_answer" ? "finalizing" : "running";
       activeRun.progressPhase = event.phase ?? activeRun.progressPhase ?? null;
       const preview = compactRunPreview(event.text);
-      if (preview) {
-        activeRun.progressPreview = preview;
-        activeRun.lastProgressAt = timestamp;
-      }
+      maybeSetRunPreview(activeRun, event.type, preview, timestamp);
+      activeRun.stallWarningSent = false;
+      return activeRun;
+    }
+    case "toolProgress":
+    case "reasoningProgress":
+    case "mcpServerStatus":
+    case "threadStatusChanged": {
+      activeRun.status = "running";
+      const preview = buildLifecycleObservationPreview(event, activeRun);
+      maybeSetRunPreview(activeRun, event.type, preview, timestamp);
       activeRun.stallWarningSent = false;
       return activeRun;
     }
@@ -417,6 +665,8 @@ export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().
         startedAt: timestamp
       });
       activeRun.toolWaitStartedAt = activeRun.toolWaitStartedAt ?? timestamp;
+      const preview = buildLifecycleObservationPreview(event, activeRun);
+      maybeSetRunPreview(activeRun, event.type, preview, timestamp);
       activeRun.stallWarningSent = false;
       return activeRun;
     }
@@ -494,6 +744,21 @@ export function classifyRunStall(activeRun, nowMs = Date.now()) {
   const toolWaitStartedAtMs = timestampToMs(activeRun.toolWaitStartedAt);
   if (activeToolItems.size && Number.isFinite(toolWaitStartedAtMs)) {
     const toolWaitMs = nowMs - toolWaitStartedAtMs;
+    const toolHangTimeoutMs = activeRun.isBulkRun
+      ? BULK_TOOL_CALL_HANG_TIMEOUT_MS
+      : TOOL_CALL_HANG_TIMEOUT_MS;
+    const oldestTool = getOldestActiveToolItem(activeRun);
+    if (toolWaitMs >= toolHangTimeoutMs) {
+      return {
+        action: "stop",
+        reason: "toolHang",
+        toolWaitMs,
+        toolHangTimeoutMs,
+        toolTitle: oldestTool?.title ?? null,
+        itemType: oldestTool?.itemType ?? null
+      };
+    }
+
     return { action: "extend", reason: "activeToolCall", toolWaitMs };
   }
 
@@ -528,15 +793,18 @@ function buildRunStallExtensionMessage(activeRun, classification) {
 function buildRunContinuationMessage(activeRun, classification) {
   switch (classification.reason) {
     case "activeToolCall":
-      return activeRun.isBulkRun
-        ? "Working update:\nThe current bulk tool call is still active. I am waiting for it to finish and will keep posting updates here."
-        : "Working update:\nThe current tool call is still active. I am waiting for it to finish and will keep posting updates here.";
+      return buildActiveToolWaitMessage(activeRun, {
+        includeWaitingTail: true,
+        bulkWaitingTail: "I am waiting for it to finish and will keep posting updates here."
+      });
     case "recentBulkProgress":
       return "Working update:\nI saw fresh bulk-run progress. The run is still alive, so I am letting it continue.";
     case "waiting":
       return activeRun.isBulkRun
         ? "Working update:\nThe run is still in progress. I have not received a completed result yet, so I am continuing to wait."
-        : "Working update:\nThe run is still in progress. I have not received a completed result yet, so I am continuing to wait.";
+        : buildActiveToolWaitMessage(activeRun, {
+            includeWaitingTail: false
+          });
     default:
       return buildRunStallExtensionMessage(activeRun, classification);
   }
@@ -1420,6 +1688,11 @@ function btwRunKey(phoneKey) {
   return `btw:${phoneKey}`;
 }
 
+function parseRunKeyPhoneKey(runKey) {
+  const match = String(runKey ?? "").match(/^(?:project|btw):([^:]+)/);
+  return match?.[1] ?? null;
+}
+
 function splitPayloadTokens(value) {
   return String(value ?? "")
     .trim()
@@ -1805,6 +2078,42 @@ export class WhatsAppControllerBridge {
           progressPreview
         })
       );
+    } finally {
+      activeRun.sendingProgressUpdate = false;
+    }
+  }
+
+  async flushBufferedRunProgressUpdate({
+    phoneKey,
+    remoteJid,
+    scopeType = "project",
+    projectAlias = null,
+    activeRun
+  }) {
+    if (!activeRun || activeRun.sendingProgressUpdate) {
+      return false;
+    }
+
+    if (!shouldFlushBufferedProgressUpdate(activeRun)) {
+      return false;
+    }
+
+    const progressPreview = activeRun.progressPreview;
+    activeRun.sendingProgressUpdate = true;
+    activeRun.lastProgressSentAt = new Date().toISOString();
+    activeRun.lastProgressSentPreview = progressPreview;
+
+    try {
+      await this.sendReply(
+        remoteJid,
+        formatRunProgressUpdate({
+          scopeType,
+          projectAlias,
+          activeProjectAlias: this.getActiveProject(phoneKey).alias,
+          progressPreview
+        })
+      );
+      return true;
     } finally {
       activeRun.sendingProgressUpdate = false;
     }
@@ -2234,16 +2543,24 @@ export class WhatsAppControllerBridge {
     }
 
     const stallTimeoutMs = activeRun.stallTimeoutMs ?? RUN_STALL_TIMEOUT_MS;
-    const warningDelayMs = activeRun.isBulkRun
-      ? 90_000
-      : Math.max(
-          30_000,
-          stallTimeoutMs - Math.min(STALL_WARNING_LEAD_MS, Math.floor(stallTimeoutMs / 2))
-        );
+    if (STALL_WARNING_LEAD_MS > 0) {
+      const warningDelayMs = activeRun.isBulkRun
+        ? Math.max(30_000, stallTimeoutMs - STALL_WARNING_LEAD_MS)
+        : Math.max(
+            30_000,
+            stallTimeoutMs - Math.min(STALL_WARNING_LEAD_MS, Math.floor(stallTimeoutMs / 2))
+          );
 
-    activeRun.stallWarningTimer = setTimeout(() => {
-      this.handleRunStallWarning(runKey).catch(() => {});
-    }, warningDelayMs);
+      if (warningDelayMs < stallTimeoutMs) {
+        activeRun.stallWarningTimer = setTimeout(() => {
+          this.handleRunStallWarning(runKey).catch(() => {});
+        }, warningDelayMs);
+      } else {
+        activeRun.stallWarningTimer = null;
+      }
+    } else {
+      activeRun.stallWarningTimer = null;
+    }
 
     activeRun.stallTimer = setTimeout(() => {
       this.handleRunStall(runKey).catch(() => {});
@@ -2262,9 +2579,23 @@ export class WhatsAppControllerBridge {
       return;
     }
 
-    const waitingMessage = activeRun.isBulkRun
-      ? "Working update:\nStill waiting for the current bulk tool call to return. No new batch is confirmed yet."
-      : "Working update:\nStill waiting for the current tool call to return.";
+    const phoneKey = parseRunKeyPhoneKey(runKey);
+    const scopeType = activeRun.scopeType ?? (runKey.startsWith("btw:") ? "btw" : "project");
+    const projectAlias = activeRun.projectAlias ?? null;
+    const flushed = await this.flushBufferedRunProgressUpdate({
+      phoneKey,
+      remoteJid,
+      scopeType,
+      projectAlias,
+      activeRun
+    });
+    if (flushed) {
+      return;
+    }
+
+    const waitingMessage = buildActiveToolWaitMessage(activeRun, {
+      bulkWaitingTail: "No new batch is confirmed yet."
+    });
 
     await this.sendReply(remoteJid, waitingMessage);
   }
@@ -2278,9 +2609,26 @@ export class WhatsAppControllerBridge {
     const classification = classifyRunStall(activeRun);
     if (classification.action === "extend") {
       activeRun.timedOut = false;
+      activeRun.timeoutDetails = null;
       activeRun.stallExtensionCount = (activeRun.stallExtensionCount ?? 0) + 1;
       activeRun.stallWarningSent = false;
       this.resetRunStallTimer(runKey);
+
+      const phoneKey = parseRunKeyPhoneKey(runKey);
+      const scopeType = activeRun.scopeType ?? (runKey.startsWith("btw:") ? "btw" : "project");
+      const projectAlias = activeRun.projectAlias ?? null;
+      const flushed = activeRun.remoteJid
+        ? await this.flushBufferedRunProgressUpdate({
+            phoneKey,
+            remoteJid: activeRun.remoteJid,
+            scopeType,
+            projectAlias,
+            activeRun
+          })
+        : false;
+      if (flushed) {
+        return;
+      }
 
       const extensionMessage = buildRunContinuationMessage(activeRun, classification);
       if (extensionMessage && activeRun.remoteJid) {
@@ -2290,6 +2638,7 @@ export class WhatsAppControllerBridge {
     }
 
     activeRun.timedOut = true;
+    activeRun.timeoutDetails = classification;
 
     await activeRun.interrupt().catch(() => {
       if (!activeRun.child.killed) {
@@ -3820,8 +4169,12 @@ export class WhatsAppControllerBridge {
       scopeType === "project"
         ? chatSession.projects?.[project.alias] ?? defaultProjectSession()
         : defaultProjectSession();
+    const runInWorkerThread =
+      scopeType === "project" && looksLikeIsolatedConnectorWritePrompt(prompt);
     const existingThreadId =
-      scopeType === "project" && !forceNewThread ? projectSession.threadId ?? null : null;
+      scopeType === "project" && !forceNewThread && !runInWorkerThread
+        ? projectSession.threadId ?? null
+        : null;
     const permissionLevel = resolveSessionPermissionLevel(config, project, projectSession);
     const sessionVoiceReply = resolveSessionVoiceReply(chatSession);
     const activeVoiceReply =
@@ -3857,12 +4210,21 @@ export class WhatsAppControllerBridge {
         threadId: existingThreadId,
         threadName: existingThreadId
           ? null
-          : buildThreadName({
-              label,
-              phoneKey,
-              projectAlias: scopeType === "project" ? project.alias : null,
-              scopeType
-            }),
+          : runInWorkerThread
+            ? buildWorkerThreadName(
+                buildThreadName({
+                  label,
+                  phoneKey,
+                  projectAlias: scopeType === "project" ? project.alias : null,
+                  scopeType
+                })
+              )
+            : buildThreadName({
+                label,
+                phoneKey,
+                projectAlias: scopeType === "project" ? project.alias : null,
+                scopeType
+              }),
         model: project.model ?? config.model,
         profile: project.profile ?? config.profile,
         search: project.search ?? config.search,
@@ -3950,6 +4312,7 @@ export class WhatsAppControllerBridge {
       lastProgressAt: null,
       progressPhase: null,
       progressPreview: null,
+      progressPreviewPriority: 0,
       lastProgressSentAt: null,
       lastProgressSentPreview: null,
       sendingProgressUpdate: false,
@@ -3965,11 +4328,14 @@ export class WhatsAppControllerBridge {
       stallWarningSent: false,
       stallExtensionCount: 0,
       timedOut: false,
+      timeoutDetails: null,
       activeToolItems: new Map(),
       toolWaitStartedAt: null,
       voiceReply: cloneVoiceReplySetting(activeVoiceReply),
       scopeType,
-      projectAlias: scopeType === "project" ? project.alias : null
+      projectAlias: scopeType === "project" ? project.alias : null,
+      workerMode: runInWorkerThread,
+      sessionAnchorThreadId: projectSession.threadId ?? null
     };
     this.activeRuns.set(runKey, activeRun);
     this.resetRunStallTimer(runKey);
@@ -4031,7 +4397,9 @@ export class WhatsAppControllerBridge {
             label
           },
           projectPatch: {
-            threadId: result.threadId,
+            threadId: activeRun.workerMode
+              ? activeRun.sessionAnchorThreadId ?? projectSession.threadId ?? null
+              : result.threadId,
             pendingApproval: null,
             lastReplyAt: new Date().toISOString(),
             lastReplyPreview: replyText.slice(0, 200),
@@ -4141,7 +4509,7 @@ export class WhatsAppControllerBridge {
       }
 
       const failureMessage = activeRun.timedOut
-        ? "Codex run stalled while waiting for a tool response and was stopped."
+        ? buildTimedOutFailureMessage(activeRun)
         : sanitizeErrorTextForWhatsApp(error?.message);
 
       if (scopeType === "project") {

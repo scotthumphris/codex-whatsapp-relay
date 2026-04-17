@@ -255,6 +255,88 @@ test("normalizeCodexTurnNotification surfaces non-message item lifecycle events"
   );
 });
 
+test("normalizeCodexTurnNotification surfaces selected native progress signals", () => {
+  assert.deepEqual(
+    normalizeCodexTurnNotification(
+      {
+        method: "item/commandExecution/outputDelta",
+        params: {
+          turnId: "turn-1",
+          itemId: "tool-1",
+          delta: "Created temp file"
+        }
+      },
+      { activeTurnId: "turn-1", resolvedThreadId: "thread-1" }
+    ),
+    {
+      type: "toolProgress",
+      turnId: "turn-1",
+      itemId: "tool-1",
+      itemType: "commandExecution",
+      text: "Created temp file"
+    }
+  );
+
+  assert.deepEqual(
+    normalizeCodexTurnNotification(
+      {
+        method: "item/reasoning/summaryTextDelta",
+        params: {
+          turnId: "turn-1",
+          itemId: "reasoning-1",
+          delta: "Checking calendar connector state"
+        }
+      },
+      { activeTurnId: "turn-1", resolvedThreadId: "thread-1" }
+    ),
+    {
+      type: "reasoningProgress",
+      turnId: "turn-1",
+      itemId: "reasoning-1",
+      text: "Checking calendar connector state"
+    }
+  );
+
+  assert.deepEqual(
+    normalizeCodexTurnNotification(
+      {
+        method: "thread/status/changed",
+        params: {
+          threadId: "thread-1",
+          status: "running"
+        }
+      },
+      { activeTurnId: "turn-1", resolvedThreadId: "thread-1" }
+    ),
+    {
+      type: "threadStatusChanged",
+      threadId: "thread-1",
+      status: "running"
+    }
+  );
+
+  assert.deepEqual(
+    normalizeCodexTurnNotification(
+      {
+        method: "mcpServer/startupStatus/updated",
+        params: {
+          serverName: "google-calendar",
+          status: "starting",
+          message: "Initializing connector"
+        }
+      },
+      { activeTurnId: "turn-1", resolvedThreadId: "thread-1" }
+    ),
+    {
+      type: "mcpServerStatus",
+      threadId: null,
+      serverName: "google-calendar",
+      status: "starting",
+      detail: "Initializing connector"
+    }
+  );
+});
+
 test("normalizeCodexTurnNotification ignores unrelated turns and threads", () => {
   assert.equal(
     normalizeCodexTurnNotification(

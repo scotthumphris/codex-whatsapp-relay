@@ -7,19 +7,7 @@ import {
   pluginRoot,
   repoRoot
 } from "./paths.mjs";
-
-function isPidRunning(pid) {
-  if (!pid) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
+import { isControllerPidRunning } from "./controller-process-check.mjs";
 
 async function readControllerOwner(filePath = globalControllerOwnerFile) {
   try {
@@ -32,7 +20,17 @@ async function readControllerOwner(filePath = globalControllerOwnerFile) {
   }
 }
 
-export async function getGlobalControllerOwner(filePath = globalControllerOwnerFile) {
+export async function getGlobalControllerOwner(
+  filePath = globalControllerOwnerFile,
+  { isPidRunning = isControllerPidRunning } = {}
+) {
+  return getGlobalControllerOwnerWithOptions(filePath, { isPidRunning });
+}
+
+async function getGlobalControllerOwnerWithOptions(
+  filePath = globalControllerOwnerFile,
+  { isPidRunning = isControllerPidRunning } = {}
+) {
   const owner = await readControllerOwner(filePath);
   if (!owner?.pid) {
     return null;
@@ -53,7 +51,8 @@ export async function claimGlobalControllerOwner(
     pluginRootPath = pluginRoot,
     startedAt = new Date().toISOString()
   } = {},
-  filePath = globalControllerOwnerFile
+  filePath = globalControllerOwnerFile,
+  { isPidRunning = isControllerPidRunning } = {}
 ) {
   const owner = {
     pid,
@@ -78,7 +77,9 @@ export async function claimGlobalControllerOwner(
         throw error;
       }
 
-      const existingOwner = await getGlobalControllerOwner(filePath);
+      const existingOwner = await getGlobalControllerOwnerWithOptions(filePath, {
+        isPidRunning
+      });
       if (!existingOwner) {
         continue;
       }
@@ -105,7 +106,8 @@ export async function claimGlobalControllerOwner(
 
 export async function releaseGlobalControllerOwner(
   { pid = process.pid } = {},
-  filePath = globalControllerOwnerFile
+  filePath = globalControllerOwnerFile,
+  { isPidRunning = isControllerPidRunning } = {}
 ) {
   const owner = await readControllerOwner(filePath);
   if (!owner) {
