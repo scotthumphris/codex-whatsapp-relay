@@ -27,6 +27,10 @@ const VERTICAL_BLOCKS = {
   "11": "█"
 };
 
+const RECONNECT_BASE_DELAY_MS = 1_500;
+const RECONNECT_MAX_DELAY_MS = 30_000;
+const SOCKET_HEARTBEAT_MS = 30_000;
+
 function buildQrMatrix(value, quietZone = 2) {
   const qr = new QRCode(-1, QRErrorCorrectLevel.L);
   qr.addData(value);
@@ -149,6 +153,9 @@ export class WhatsAppRuntime {
     this.startPromise = null;
     this.shouldRenderQr = false;
     this.closing = false;
+    this.reconnectTimer = null;
+    this.heartbeatTimer = null;
+    this.reconnectAttempts = 0;
     this.state = {
       status: "idle",
       hasCreds: existsSync(credsFile),
@@ -156,6 +163,9 @@ export class WhatsAppRuntime {
       lastQrAt: null,
       currentQrText: null,
       lastDisconnect: null,
+      reconnectAttempts: 0,
+      nextReconnectAt: null,
+      lastSocketHeartbeatAt: null,
       authDir,
       runtimeFile
     };
@@ -194,6 +204,7 @@ export class WhatsAppRuntime {
 
   async #startInternal({ printQrToTerminal }) {
     await this.initialize();
+    this.#clearReconnectTimer();
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestWaWebVersion();
 
@@ -275,20 +286,28 @@ export class WhatsAppRuntime {
       }
 
       if (update.connection === "open") {
+        this.#clearReconnectTimer();
+        this.#startHeartbeat(socket);
+        this.reconnectAttempts = 0;
         this.state.status = "connected";
         this.state.user = socket.user ?? null;
         this.state.lastDisconnect = null;
         this.state.currentQrText = null;
         this.state.hasCreds = this.hasSavedCreds();
+        this.state.reconnectAttempts = 0;
+        this.state.nextReconnectAt = null;
+        this.state.lastSocketHeartbeatAt = new Date().toISOString();
         this.store.updateMeta({
           lastConnection: {
             openedAt: new Date().toISOString(),
             user: socket.user ?? null
           }
         });
+        socket.sendPresenceUpdate("available").catch(() => {});
       }
 
       if (update.connection === "close") {
+        this.#clearHeartbeat();
         const code = disconnectCode(update.lastDisconnect?.error);
         const label = disconnectLabel(code);
         this.state.status =
@@ -308,11 +327,7 @@ export class WhatsAppRuntime {
           code !== DisconnectReason.loggedOut &&
           code !== DisconnectReason.connectionReplaced
         ) {
-          setTimeout(() => {
-            this.start({ printQrToTerminal: false, force: true }).catch((error) => {
-              console.error("failed to reconnect WhatsApp runtime", error);
-            });
-          }, 1500);
+          this.#scheduleReconnect();
         }
       }
 
@@ -324,6 +339,68 @@ export class WhatsAppRuntime {
     });
 
     return socket;
+  }
+
+  #clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.state.nextReconnectAt = null;
+  }
+
+  #clearHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  #scheduleReconnect() {
+    if (this.reconnectTimer || this.closing) {
+      return;
+    }
+
+    this.reconnectAttempts += 1;
+    const delayMs = Math.min(
+      RECONNECT_MAX_DELAY_MS,
+      RECONNECT_BASE_DELAY_MS * 2 ** Math.max(0, this.reconnectAttempts - 1)
+    );
+    this.state.reconnectAttempts = this.reconnectAttempts;
+    this.state.nextReconnectAt = new Date(Date.now() + delayMs).toISOString();
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.start({ printQrToTerminal: false, force: true }).catch((error) => {
+        console.error("failed to reconnect WhatsApp runtime", error);
+        if (!this.closing) {
+          this.#scheduleReconnect();
+        }
+      });
+    }, delayMs);
+  }
+
+  #startHeartbeat(socket) {
+    this.#clearHeartbeat();
+
+    const tick = async () => {
+      if (this.closing || this.socket !== socket || this.state.status !== "connected") {
+        return;
+      }
+
+      try {
+        await socket.sendPresenceUpdate("available");
+        this.state.lastSocketHeartbeatAt = new Date().toISOString();
+      } catch {
+        if (!this.closing) {
+          this.#scheduleReconnect();
+        }
+      }
+    };
+
+    this.heartbeatTimer = setInterval(() => {
+      tick().catch(() => {});
+    }, SOCKET_HEARTBEAT_MS);
   }
 
   on(eventName, listener) {

@@ -6,8 +6,10 @@ import path from "node:path";
 
 import {
   applyRunLifecycleEvent,
+  buildControllerRunPrompt,
   buildVoiceReplyTextCompanion,
   buildDangerFullAccessConfirmationMessage,
+  classifyRunStall,
   formatProjectRunReplyPrefix,
   buildVoiceReplyPrompt,
   extractVoiceReplyEnvelope,
@@ -23,6 +25,7 @@ import {
   resolveProjectSelection,
   resolveRunVoiceReply,
   resolveThreadSelection,
+  sanitizeErrorTextForWhatsApp,
   sanitizeReplyTextForWhatsApp,
   shouldSplitCompoundVoiceControlRequest
 } from "./controller-bridge.mjs";
@@ -193,6 +196,34 @@ test("buildDangerFullAccessConfirmationMessage includes the project when confirm
   );
 });
 
+test("buildControllerRunPrompt adds bulk-action guidance for WhatsApp runs", () => {
+  const prompt = buildControllerRunPrompt("Clean my Gmail promotions in safe batches.");
+
+  assert.match(prompt, /WhatsApp-controlled Codex session/);
+  assert.match(prompt, /work in bounded batches instead of one giant mutation/i);
+  assert.match(prompt, /post a short progress update/i);
+});
+
+test("sanitizeErrorTextForWhatsApp strips noisy diagnostics and falls back cleanly", () => {
+  const noisy = [
+    "IwfMtGkS9WGHZTAJgjj0B.2IFwxwyS0BW8XkeuvWaPA-1776430980-1.2.1.1-uyGCkaVKQ9bq7nkHAiz7jNmghrmA2jje3EZNomzWXlb2j6ipWtJbGUg6Yr_IeD9bAnFXY_OoCfMqXSfVi1YspRRkuW2RJWMJIubVHHRIOR_XU",
+    "\u001b[2m2026-04-17T13:02:55.444618Z\u001b[0m WARN codex_core::plugins::manager: failed to warm featured plugin ids cache",
+    "<html><body>Enable JavaScript and cookies to continue</body></html>"
+  ].join("\n");
+
+  assert.equal(
+    sanitizeErrorTextForWhatsApp(noisy),
+    "Codex failed before it could finish the run."
+  );
+});
+
+test("sanitizeErrorTextForWhatsApp keeps short actionable failures", () => {
+  assert.equal(
+    sanitizeErrorTextForWhatsApp("Gmail bulk label call failed with HTTP 429. Try again later."),
+    "Gmail bulk label call failed with HTTP 429. Try again later."
+  );
+});
+
 test("requiresTextConfirmationForVoicePrompt flags high-impact repo actions", () => {
   assert.equal(requiresTextConfirmationForVoicePrompt("merge PR 49 to main"), true);
   assert.equal(
@@ -245,7 +276,9 @@ test("applyRunLifecycleEvent tracks live progress and approvals for an active ru
     progressPhase: null,
     progressPreview: null,
     lastEventAt: null,
-    lastProgressAt: null
+    lastProgressAt: null,
+    activeToolItems: new Map(),
+    toolWaitStartedAt: null
   };
 
   applyRunLifecycleEvent(
@@ -282,6 +315,120 @@ test("applyRunLifecycleEvent tracks live progress and approvals for an active ru
   );
   assert.equal(activeRun.status, "waiting_for_approval");
   assert.equal(activeRun.lastEventAt, "2026-03-30T10:00:03.000Z");
+});
+
+test("applyRunLifecycleEvent tracks active tool calls separately from agent messages", () => {
+  const activeRun = {
+    status: "running",
+    activeToolItems: new Map(),
+    toolWaitStartedAt: null,
+    lastEventAt: null
+  };
+
+  applyRunLifecycleEvent(
+    activeRun,
+    {
+      type: "itemStarted",
+      itemId: "tool-1",
+      itemType: "functionCall",
+      title: "gmail_bulk_label_matching_emails"
+    },
+    "2026-03-30T10:00:04.000Z"
+  );
+  assert.equal(activeRun.activeToolItems.size, 1);
+  assert.equal(activeRun.toolWaitStartedAt, "2026-03-30T10:00:04.000Z");
+
+  applyRunLifecycleEvent(
+    activeRun,
+    {
+      type: "itemCompleted",
+      itemId: "tool-1",
+      itemType: "functionCall"
+    },
+    "2026-03-30T10:05:04.000Z"
+  );
+  assert.equal(activeRun.activeToolItems.size, 0);
+  assert.equal(activeRun.toolWaitStartedAt, null);
+});
+
+test("classifyRunStall extends bulk runs that are still inside an active tool call", () => {
+  const startedAt = Date.parse("2026-03-30T10:00:00.000Z");
+  const nowMs = startedAt + 11 * 60_000;
+  const activeRun = {
+    isBulkRun: true,
+    pendingApproval: null,
+    startedAtMs: startedAt,
+    lastEventAt: "2026-03-30T10:00:30.000Z",
+    lastProgressAt: "2026-03-30T10:00:30.000Z",
+    activeToolItems: new Map([
+      ["tool-1", { itemType: "functionCall", startedAt: "2026-03-30T10:01:00.000Z" }]
+    ]),
+    toolWaitStartedAt: "2026-03-30T10:01:00.000Z"
+  };
+
+  assert.deepEqual(classifyRunStall(activeRun, nowMs), {
+    action: "extend",
+    reason: "activeToolCall",
+    toolWaitMs: 10 * 60_000
+  });
+});
+
+test("classifyRunStall extends bulk runs that showed fresh progress", () => {
+  const startedAt = Date.parse("2026-03-30T10:00:00.000Z");
+  const nowMs = startedAt + 12 * 60_000;
+  const activeRun = {
+    isBulkRun: true,
+    pendingApproval: null,
+    startedAtMs: startedAt,
+    lastEventAt: "2026-03-30T10:11:30.000Z",
+    lastProgressAt: "2026-03-30T10:11:30.000Z",
+    activeToolItems: new Map(),
+    toolWaitStartedAt: null
+  };
+
+  assert.deepEqual(classifyRunStall(activeRun, nowMs), {
+    action: "extend",
+    reason: "recentBulkProgress"
+  });
+});
+
+test("classifyRunStall keeps waiting instead of stopping when a run is quiet but under the hard limit", () => {
+  const startedAt = Date.parse("2026-03-30T10:00:00.000Z");
+  const nowMs = startedAt + 20 * 60_000;
+  const activeRun = {
+    isBulkRun: false,
+    pendingApproval: null,
+    startedAtMs: startedAt,
+    lastEventAt: "2026-03-30T10:05:00.000Z",
+    lastProgressAt: "2026-03-30T10:05:00.000Z",
+    activeToolItems: new Map(),
+    toolWaitStartedAt: null
+  };
+
+  assert.deepEqual(classifyRunStall(activeRun, nowMs), {
+    action: "extend",
+    reason: "waiting"
+  });
+});
+
+test("classifyRunStall stops only when the hard timeout is exceeded", () => {
+  const startedAt = Date.parse("2026-03-30T10:00:00.000Z");
+  const nowMs = startedAt + 2 * 60 * 60_000;
+  const activeRun = {
+    isBulkRun: false,
+    pendingApproval: null,
+    startedAtMs: startedAt,
+    lastEventAt: "2026-03-30T10:05:00.000Z",
+    lastProgressAt: "2026-03-30T10:05:00.000Z",
+    activeToolItems: new Map(),
+    toolWaitStartedAt: null
+  };
+
+  assert.deepEqual(classifyRunStall(activeRun, nowMs), {
+    action: "stop",
+    reason: "hardTimeout",
+    hardTimeoutMs: 2 * 60 * 60_000
+  });
 });
 
 test("WhatsAppControllerBridge summary reports the active project's thread id", () => {
@@ -413,6 +560,90 @@ test("renderSessionStatus includes queued message counts for project and btw sco
 
   assert.match(bridge.renderSessionStatus("123"), /queued_messages: 2/);
   assert.match(bridge.renderSessionStatus("123", "btw"), /queued_messages: 1/);
+});
+
+test("processStartupBacklog ignores stale cached messages", async () => {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const handled = [];
+  const bridge = new WhatsAppControllerBridge({
+    runtime: {
+      store: {
+        getMessages() {
+          return [
+            {
+              id: "old-msg",
+              chatId: "123@s.whatsapp.net",
+              fromMe: false,
+              timestamp: nowSeconds - 60 * 60,
+              text: "stale"
+            },
+            {
+              id: "fresh-msg",
+              chatId: "123@s.whatsapp.net",
+              fromMe: false,
+              timestamp: nowSeconds - 30,
+              text: "fresh"
+            }
+          ];
+        }
+      }
+    },
+    configStore: {
+      async load() {
+        return { enabled: true };
+      }
+    },
+    stateStore: {
+      listSessions() {
+        return [
+          {
+            remoteJid: "123@s.whatsapp.net",
+            label: "Test User",
+            lastInboundAt: null
+          }
+        ];
+      }
+    }
+  });
+
+  bridge.handleIncomingMessage = async (message) => {
+    handled.push(message.key.id);
+  };
+
+  await bridge.processStartupBacklog();
+  assert.deepEqual(handled, ["fresh-msg"]);
+});
+
+test("sendTextMessage retries transient disconnect failures", async () => {
+  let sendAttempts = 0;
+  const bridge = new WhatsAppControllerBridge({
+    runtime: {
+      async ensureConnected() {
+        return {
+          async sendMessage() {
+            sendAttempts += 1;
+            if (sendAttempts === 1) {
+              throw new Error("connection closed");
+            }
+            return {
+              key: {
+                id: "out-1"
+              }
+            };
+          }
+        };
+      }
+    },
+    configStore: { data: {} },
+    stateStore: {
+      getSession() {
+        return {};
+      }
+    }
+  });
+
+  await bridge.sendTextMessage("123@s.whatsapp.net", "hello");
+  assert.equal(sendAttempts, 2);
 });
 
 test("runNextQueuedPrompt dequeues and dispatches the next queued prompt", async () => {

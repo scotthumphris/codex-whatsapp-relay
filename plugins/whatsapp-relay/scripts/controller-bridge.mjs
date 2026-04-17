@@ -42,6 +42,13 @@ import {
 
 const MAX_WHATSAPP_MESSAGE = 3500;
 const HEARTBEAT_MS = 30_000;
+const RUN_STALL_TIMEOUT_MS = 90_000;
+const BULK_RUN_STALL_TIMEOUT_MS = 120_000;
+const STALL_WARNING_LEAD_MS = 60_000;
+const STALL_RACE_GRACE_MS = 15_000;
+const RUN_HARD_TIMEOUT_MS = 2 * 60 * 60_000;
+const BULK_RUN_HARD_TIMEOUT_MS = 4 * 60 * 60_000;
+const BULK_PROGRESS_EXTENSION_WINDOW_MS = 2 * 60_000;
 const RECENT_MESSAGE_LIMIT = 500;
 const OUTBOX_POLL_MS = 1_000;
 const SESSION_LIST_LIMIT = 12;
@@ -49,8 +56,27 @@ const SESSION_CONNECT_SEARCH_LIMIT = 50;
 const THREAD_SHORTCUT_TTL_MS = 30 * 60_000;
 const DANGER_CONFIRMATION_WINDOW_MS = 60_000;
 const ACTIVE_RUN_PREVIEW_LIMIT = 160;
+const LONG_RUN_PROGRESS_DELAY_MS = 45_000;
+const BULK_RUN_PROGRESS_DELAY_MS = 15_000;
+const MIN_PROGRESS_UPDATE_INTERVAL_MS = 30_000;
 const VOICE_REPLY_SPEEDS = new Set(["1x", "2x"]);
 const LOGGED_OUT_RECOVERY_MS = 60_000;
+const STARTUP_BACKLOG_LIMIT = 10;
+const STARTUP_BACKLOG_MAX_AGE_MS = 10 * 60_000;
+const SEND_RETRY_ATTEMPTS = 4;
+const SEND_RETRY_BASE_DELAY_MS = 750;
+const SEND_RETRY_CONNECT_TIMEOUT_MS = 20_000;
+const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g;
+const HTML_TAG_PATTERN = /<[^>]+>/i;
+const OPAQUE_TOKEN_PATTERN = /[A-Za-z0-9._-]{120,}/;
+const NOISY_ERROR_PATTERNS = [
+  /failed to warm featured plugin ids cache/i,
+  /codex_core::plugins::/i,
+  /interface\.defaultPrompt/i,
+  /enable javascript and cookies to continue/i,
+  /backend-api\/plugins\/featured/i,
+  /cloudflare/i
+];
 const VOICE_REPLY_LANGUAGE_TAG =
   /^\s*\[\[\s*reply_language\s*:\s*([a-z]{2,3}(?:[-_][a-z0-9]{2,8})?)\s*\]\]\s*/i;
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)\]\(([^)]+)\)/g;
@@ -175,6 +201,135 @@ function compactRunPreview(value, limit = ACTIVE_RUN_PREVIEW_LIMIT) {
   return text ? text.slice(0, limit) : null;
 }
 
+function timestampToMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function stripAnsi(value) {
+  return String(value ?? "").replace(ANSI_ESCAPE_PATTERN, "");
+}
+
+function buildRecentMessageKey(chatId, messageId) {
+  const normalizedChatId = String(chatId ?? "").trim();
+  const normalizedMessageId = String(messageId ?? "").trim();
+  if (!normalizedChatId || !normalizedMessageId) {
+    return null;
+  }
+
+  return `${normalizedChatId}:${normalizedMessageId}`;
+}
+
+function looksLikeBulkOperationPrompt(prompt) {
+  const normalized = String(prompt ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    /\bbulk\b/,
+    /\bcleanup\b/,
+    /\bclean up\b/,
+    /\bthorough clean\b/,
+    /\btriage\b.*\b(?:inbox|mailbox|email|emails)\b/,
+    /\barchive\b/,
+    /\blabel\b/,
+    /\bdelete\b/,
+    /\bmove\b/,
+    /\bunsubscribe\b/,
+    /\bsweep\b/,
+    /\bpromotions\b/,
+    /\bnewsletter\b/,
+    /\bmailbox\b/,
+    /\bgmail\b/
+  ].some((pattern) => pattern.test(normalized));
+}
+
+export function buildControllerRunPrompt(prompt) {
+  return [
+    String(prompt ?? "").trim(),
+    "",
+    "Controller note for the assistant:",
+    "- This request came from a WhatsApp-controlled Codex session.",
+    "- Use brief commentary when the task takes a while so progress can be forwarded back to WhatsApp.",
+    "- For bulk actions or large mailbox cleanup, work in bounded batches instead of one giant mutation.",
+    "- Before the first write batch, state the intended batch size and strategy in commentary.",
+    "- After each meaningful batch, post a short progress update with what changed, what remains, and any issue.",
+    "- Prefer reversible steps first when possible, for example label then archive, or one small batch before scaling up.",
+    "- If a bulk tool call hangs, errors, or behaves unexpectedly, stop and report the issue instead of retrying blindly."
+  ].join("\n");
+}
+
+function isRetryableSendDisconnectError(error) {
+  const message = String(error?.message ?? error ?? "");
+  return /closed|reset|disconnect|timed out|timeout|connection|socket|stream errored|not connected/i.test(
+    message
+  );
+}
+
+export function sanitizeErrorTextForWhatsApp(
+  text,
+  {
+    fallback = "Codex failed before it could finish the run.",
+    maxLength = 500
+  } = {}
+) {
+  const normalized = stripAnsi(text).replace(/\r/g, "").trim();
+  if (!normalized) {
+    return fallback;
+  }
+
+  if (
+    HTML_TAG_PATTERN.test(normalized) ||
+    OPAQUE_TOKEN_PATTERN.test(normalized) ||
+    NOISY_ERROR_PATTERNS.some((pattern) => pattern.test(normalized))
+  ) {
+    return fallback;
+  }
+
+  const candidate = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => {
+      if (line.startsWith(">")) {
+        return false;
+      }
+
+      if (/^\d{4}-\d{2}-\d{2}t/i.test(line)) {
+        return false;
+      }
+
+      if (HTML_TAG_PATTERN.test(line) || OPAQUE_TOKEN_PATTERN.test(line)) {
+        return false;
+      }
+
+      return !NOISY_ERROR_PATTERNS.some((pattern) => pattern.test(line));
+    })
+    .slice(0, 3)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!candidate) {
+    return fallback;
+  }
+
+  if (candidate.length > maxLength) {
+    return `${candidate.slice(0, maxLength - 3).trimEnd()}...`;
+  }
+
+  return candidate;
+}
+
 function buildActiveRunStatusLines(activeRun) {
   if (!activeRun) {
     return [];
@@ -185,6 +340,45 @@ function buildActiveRunStatusLines(activeRun) {
     activeRun.progressPreview ? `run_preview: ${activeRun.progressPreview}` : null,
     activeRun.lastProgressAt ? `run_progress_at: ${activeRun.lastProgressAt}` : null
   ].filter(Boolean);
+}
+
+function shouldSendRunProgressUpdate(activeRun, nowMs = Date.now()) {
+  if (!activeRun?.progressPreview || activeRun.pendingApproval) {
+    return false;
+  }
+
+  if (activeRun.progressPhase === "final_answer") {
+    return false;
+  }
+
+  const startedAtMs = Date.parse(activeRun.startedAt ?? "");
+  const progressDelayMs = activeRun.progressDelayMs ?? LONG_RUN_PROGRESS_DELAY_MS;
+  if (!Number.isFinite(startedAtMs) || nowMs - startedAtMs < progressDelayMs) {
+    return false;
+  }
+
+  const lastSentAtMs = Date.parse(activeRun.lastProgressSentAt ?? "");
+  if (Number.isFinite(lastSentAtMs) && nowMs - lastSentAtMs < MIN_PROGRESS_UPDATE_INTERVAL_MS) {
+    return false;
+  }
+
+  return activeRun.progressPreview !== activeRun.lastProgressSentPreview;
+}
+
+function formatRunProgressUpdate({
+  scopeType = "project",
+  projectAlias = null,
+  activeProjectAlias = null,
+  progressPreview = ""
+}) {
+  const prefix =
+    scopeType === "btw"
+      ? "Working update"
+      : activeProjectAlias && projectAlias && activeProjectAlias !== projectAlias
+        ? `Working update from ${projectAlias}`
+        : "Working update";
+
+  return `${prefix}:\n${progressPreview}`;
 }
 
 export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().toISOString()) {
@@ -198,6 +392,7 @@ export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().
     case "turnStarted":
       activeRun.status = "running";
       activeRun.threadId = activeRun.threadId ?? event.threadId ?? null;
+      activeRun.stallWarningSent = false;
       return activeRun;
     case "agentMessageStarted":
     case "agentMessageDelta":
@@ -209,6 +404,31 @@ export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().
         activeRun.progressPreview = preview;
         activeRun.lastProgressAt = timestamp;
       }
+      activeRun.stallWarningSent = false;
+      return activeRun;
+    }
+    case "itemStarted": {
+      const activeToolItems =
+        activeRun.activeToolItems instanceof Map ? activeRun.activeToolItems : new Map();
+      activeRun.activeToolItems = activeToolItems;
+      activeToolItems.set(event.itemId, {
+        itemType: event.itemType ?? null,
+        title: event.title ?? null,
+        startedAt: timestamp
+      });
+      activeRun.toolWaitStartedAt = activeRun.toolWaitStartedAt ?? timestamp;
+      activeRun.stallWarningSent = false;
+      return activeRun;
+    }
+    case "itemCompleted": {
+      const activeToolItems =
+        activeRun.activeToolItems instanceof Map ? activeRun.activeToolItems : new Map();
+      activeToolItems.delete(event.itemId);
+      activeRun.activeToolItems = activeToolItems;
+      if (!activeToolItems.size) {
+        activeRun.toolWaitStartedAt = null;
+      }
+      activeRun.stallWarningSent = false;
       return activeRun;
     }
     case "approvalRequested":
@@ -216,6 +436,7 @@ export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().
       return activeRun;
     case "approvalResolved":
       activeRun.status = "running";
+      activeRun.stallWarningSent = false;
       return activeRun;
     case "turnCompleted":
       activeRun.status = event.status === "completed" ? "completed" : String(event.status);
@@ -224,15 +445,100 @@ export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().
     case "turnError":
       activeRun.status = event.willRetry ? "retrying" : "failed";
       if (!activeRun.progressPreview) {
-        const preview = compactRunPreview(event.error);
+        const preview = compactRunPreview(
+          sanitizeErrorTextForWhatsApp(event.error, {
+            fallback: "Codex encountered an error while working on this run.",
+            maxLength: ACTIVE_RUN_PREVIEW_LIMIT
+          })
+        );
         if (preview) {
           activeRun.progressPreview = preview;
           activeRun.lastProgressAt = timestamp;
         }
       }
+      activeRun.stallWarningSent = false;
       return activeRun;
     default:
       return activeRun;
+  }
+}
+
+export function classifyRunStall(activeRun, nowMs = Date.now()) {
+  if (!activeRun) {
+    return { action: "stop", reason: "missingRun" };
+  }
+
+  const startedAtMs = timestampToMs(activeRun.startedAtMs ?? activeRun.startedAt);
+  const hardTimeoutMs = activeRun.isBulkRun ? BULK_RUN_HARD_TIMEOUT_MS : RUN_HARD_TIMEOUT_MS;
+  if (Number.isFinite(startedAtMs) && nowMs - startedAtMs >= hardTimeoutMs) {
+    return { action: "stop", reason: "hardTimeout", hardTimeoutMs };
+  }
+
+  if (activeRun.pendingApproval) {
+    return { action: "extend", reason: "pendingApproval" };
+  }
+
+  const lastActivityMs = [
+    timestampToMs(activeRun.lastEventAt),
+    timestampToMs(activeRun.lastProgressAt)
+  ]
+    .filter(Number.isFinite)
+    .sort((left, right) => right - left)[0] ?? null;
+
+  if (Number.isFinite(lastActivityMs) && nowMs - lastActivityMs <= STALL_RACE_GRACE_MS) {
+    return { action: "extend", reason: "recentActivity" };
+  }
+
+  const activeToolItems =
+    activeRun.activeToolItems instanceof Map ? activeRun.activeToolItems : new Map();
+  const toolWaitStartedAtMs = timestampToMs(activeRun.toolWaitStartedAt);
+  if (activeToolItems.size && Number.isFinite(toolWaitStartedAtMs)) {
+    const toolWaitMs = nowMs - toolWaitStartedAtMs;
+    return { action: "extend", reason: "activeToolCall", toolWaitMs };
+  }
+
+  if (activeRun.isBulkRun) {
+    const lastProgressAtMs = timestampToMs(activeRun.lastProgressAt);
+    if (
+      Number.isFinite(startedAtMs) &&
+      nowMs - startedAtMs < BULK_RUN_HARD_TIMEOUT_MS &&
+      Number.isFinite(lastProgressAtMs) &&
+      nowMs - lastProgressAtMs <= BULK_PROGRESS_EXTENSION_WINDOW_MS
+    ) {
+      return { action: "extend", reason: "recentBulkProgress" };
+    }
+  }
+
+  return { action: "extend", reason: "waiting" };
+}
+
+function buildRunStallExtensionMessage(activeRun, classification) {
+  switch (classification.reason) {
+    case "activeToolCall":
+      return activeRun.isBulkRun
+        ? "Working update:\nThe current bulk tool call is still active, so I’m giving it more time before I stop the run."
+        : "Working update:\nThe current tool call is still active, so I’m giving it more time before I stop the run.";
+    case "recentBulkProgress":
+      return "Working update:\nI saw fresh bulk-run progress, so I’m giving it more time before I stop the run.";
+    default:
+      return null;
+  }
+}
+
+function buildRunContinuationMessage(activeRun, classification) {
+  switch (classification.reason) {
+    case "activeToolCall":
+      return activeRun.isBulkRun
+        ? "Working update:\nThe current bulk tool call is still active. I am waiting for it to finish and will keep posting updates here."
+        : "Working update:\nThe current tool call is still active. I am waiting for it to finish and will keep posting updates here.";
+    case "recentBulkProgress":
+      return "Working update:\nI saw fresh bulk-run progress. The run is still alive, so I am letting it continue.";
+    case "waiting":
+      return activeRun.isBulkRun
+        ? "Working update:\nThe run is still in progress. I have not received a completed result yet, so I am continuing to wait."
+        : "Working update:\nThe run is still in progress. I have not received a completed result yet, so I am continuing to wait.";
+    default:
+      return buildRunStallExtensionMessage(activeRun, classification);
   }
 }
 
@@ -882,6 +1188,10 @@ export function formatProjectRunReplyPrefix({
   outcome = "completed"
 }) {
   const isBackground = activeProjectAlias && activeProjectAlias !== projectAlias;
+  if (!isBackground && outcome !== "failed") {
+    return "";
+  }
+
   const action = outcome === "failed" ? "failed" : "completed";
   const sessionLabel = threadId ? ` session ${shortThreadId(threadId)}` : "";
   const heading = isBackground
@@ -1371,6 +1681,7 @@ export class WhatsAppControllerBridge {
     this.outboxPoller = null;
     this.processingOutbox = false;
     this.activeRuns = new Map();
+    this.activePresence = new Map();
     this.recentMessageIds = [];
     this.recentMessageSet = new Set();
     this.recentOutgoingIds = [];
@@ -1462,6 +1773,41 @@ export class WhatsAppControllerBridge {
           : null;
       })
       .filter(Boolean);
+  }
+
+  async maybeSendRunProgressUpdate({
+    phoneKey,
+    remoteJid,
+    scopeType = "project",
+    projectAlias = null,
+    activeRun
+  }) {
+    if (!activeRun || activeRun.sendingProgressUpdate) {
+      return;
+    }
+
+    if (!shouldSendRunProgressUpdate(activeRun)) {
+      return;
+    }
+
+    const progressPreview = activeRun.progressPreview;
+    activeRun.sendingProgressUpdate = true;
+    activeRun.lastProgressSentAt = new Date().toISOString();
+    activeRun.lastProgressSentPreview = progressPreview;
+
+    try {
+      await this.sendReply(
+        remoteJid,
+        formatRunProgressUpdate({
+          scopeType,
+          projectAlias,
+          activeProjectAlias: this.getActiveProject(phoneKey).alias,
+          progressPreview
+        })
+      );
+    } finally {
+      activeRun.sendingProgressUpdate = false;
+    }
   }
 
   updateActiveRunVoiceReplySettings(phoneKey, voiceReply) {
@@ -1825,39 +2171,40 @@ export class WhatsAppControllerBridge {
       throw new Error("WhatsApp is not authenticated yet. Run `whatsapp_start_auth` first.");
     }
 
-    if (this.started) {
-      return this.summary();
-    }
+      if (this.started) {
+        return this.summary();
+      }
 
-    this.started = true;
-    this.startedAtMs = Date.now();
+      this.started = true;
+      this.startedAtMs = Date.now();
 
-    this.unsubscribers.push(
-      this.runtime.on("messages.upsert", (payload) => {
-        this.handleMessagesUpsert(payload).catch((error) => {
-          console.error("failed to handle WhatsApp controller message", error);
-        });
-      })
-    );
+      await this.runtime.start({ printQrToTerminal: false });
+      await this.stateStore.setProcess({
+        pid: process.pid,
+        status: "running",
+        startedAt: new Date(this.startedAtMs).toISOString(),
+        heartbeatAt: new Date().toISOString()
+      });
+      await this.processStartupBacklog();
 
-    this.unsubscribers.push(
-      this.runtime.on("connection.update", () => {
+      this.unsubscribers.push(
+        this.runtime.on("messages.upsert", (payload) => {
+          this.handleMessagesUpsert(payload).catch((error) => {
+            console.error("failed to handle WhatsApp controller message", error);
+          });
+        })
+      );
+
+      this.unsubscribers.push(
+        this.runtime.on("connection.update", () => {
+          this.touchHeartbeat().catch((error) => {
+            console.error("failed to update WhatsApp controller heartbeat", error);
+          });
+        })
+      );
+
+      this.heartbeat = setInterval(() => {
         this.touchHeartbeat().catch((error) => {
-          console.error("failed to update WhatsApp controller heartbeat", error);
-        });
-      })
-    );
-
-    await this.runtime.start({ printQrToTerminal: false });
-    await this.stateStore.setProcess({
-      pid: process.pid,
-      status: "running",
-      startedAt: new Date(this.startedAtMs).toISOString(),
-      heartbeatAt: new Date().toISOString()
-    });
-
-    this.heartbeat = setInterval(() => {
-      this.touchHeartbeat().catch((error) => {
         console.error("failed to write WhatsApp controller heartbeat", error);
       });
     }, HEARTBEAT_MS);
@@ -1870,6 +2217,140 @@ export class WhatsAppControllerBridge {
     }, OUTBOX_POLL_MS);
 
     return this.summary();
+  }
+
+  resetRunStallTimer(runKey) {
+    const activeRun = this.activeRuns.get(runKey);
+    if (!activeRun) {
+      return;
+    }
+
+    if (activeRun.stallTimer) {
+      clearTimeout(activeRun.stallTimer);
+    }
+
+    if (activeRun.stallWarningTimer) {
+      clearTimeout(activeRun.stallWarningTimer);
+    }
+
+    const stallTimeoutMs = activeRun.stallTimeoutMs ?? RUN_STALL_TIMEOUT_MS;
+    const warningDelayMs = activeRun.isBulkRun
+      ? 90_000
+      : Math.max(
+          30_000,
+          stallTimeoutMs - Math.min(STALL_WARNING_LEAD_MS, Math.floor(stallTimeoutMs / 2))
+        );
+
+    activeRun.stallWarningTimer = setTimeout(() => {
+      this.handleRunStallWarning(runKey).catch(() => {});
+    }, warningDelayMs);
+
+    activeRun.stallTimer = setTimeout(() => {
+      this.handleRunStall(runKey).catch(() => {});
+    }, stallTimeoutMs);
+  }
+
+  async handleRunStallWarning(runKey) {
+    const activeRun = this.activeRuns.get(runKey);
+    if (!activeRun || activeRun.cancelled || activeRun.pendingApproval || activeRun.stallWarningSent) {
+      return;
+    }
+
+    activeRun.stallWarningSent = true;
+    const remoteJid = activeRun.remoteJid;
+    if (!remoteJid) {
+      return;
+    }
+
+    const waitingMessage = activeRun.isBulkRun
+      ? "Working update:\nStill waiting for the current bulk tool call to return. No new batch is confirmed yet."
+      : "Working update:\nStill waiting for the current tool call to return.";
+
+    await this.sendReply(remoteJid, waitingMessage);
+  }
+
+  async handleRunStall(runKey) {
+    const activeRun = this.activeRuns.get(runKey);
+    if (!activeRun || activeRun.cancelled) {
+      return;
+    }
+
+    const classification = classifyRunStall(activeRun);
+    if (classification.action === "extend") {
+      activeRun.timedOut = false;
+      activeRun.stallExtensionCount = (activeRun.stallExtensionCount ?? 0) + 1;
+      activeRun.stallWarningSent = false;
+      this.resetRunStallTimer(runKey);
+
+      const extensionMessage = buildRunContinuationMessage(activeRun, classification);
+      if (extensionMessage && activeRun.remoteJid) {
+        await this.sendReply(activeRun.remoteJid, extensionMessage);
+      }
+      return;
+    }
+
+    activeRun.timedOut = true;
+
+    await activeRun.interrupt().catch(() => {
+      if (!activeRun.child.killed) {
+        activeRun.child.kill("SIGTERM");
+      }
+    });
+
+    await delay(300);
+    if (!activeRun.child.killed) {
+      activeRun.child.kill("SIGKILL");
+    }
+  }
+
+  async processStartupBacklog() {
+    const nowMs = Date.now();
+    for (const session of this.stateStore.listSessions()) {
+      const remoteJid = session.remoteJid;
+      if (!remoteJid) {
+        continue;
+      }
+
+      const lastInboundAtMs = session.lastInboundAt
+        ? Date.parse(session.lastInboundAt)
+        : null;
+      const backlog = this.runtime.store
+        .getMessages(remoteJid, STARTUP_BACKLOG_LIMIT)
+        .filter((item) => {
+          if (item.fromMe || !item.id || !item.chatId) {
+            return false;
+          }
+
+          if (
+            Number.isFinite(lastInboundAtMs) &&
+            item.timestamp &&
+            item.timestamp * 1000 <= lastInboundAtMs
+          ) {
+            return false;
+          }
+
+          if (item.timestamp && nowMs - item.timestamp * 1000 > STARTUP_BACKLOG_MAX_AGE_MS) {
+            return false;
+          }
+
+          return Boolean(String(item.text ?? "").trim());
+        });
+
+      for (const item of backlog) {
+        await this.handleIncomingMessage({
+          key: {
+            remoteJid: item.chatId,
+            id: item.id,
+            fromMe: false
+          },
+          pushName: item.pushName ?? session.label ?? null,
+          messageTimestamp: item.timestamp ?? undefined,
+          message: {
+            conversation: item.text
+          }
+        });
+      }
+    }
   }
 
   async stop({ clearProcess = true } = {}) {
@@ -2024,13 +2505,14 @@ export class WhatsAppControllerBridge {
     }
   }
 
-  rememberMessage(messageId) {
-    if (!messageId || this.recentMessageSet.has(messageId)) {
+  rememberMessage(messageKey) {
+    const key = String(messageKey ?? "").trim();
+    if (!key || this.recentMessageSet.has(key)) {
       return false;
     }
 
-    this.recentMessageSet.add(messageId);
-    this.recentMessageIds.push(messageId);
+    this.recentMessageSet.add(key);
+    this.recentMessageIds.push(key);
 
     if (this.recentMessageIds.length > RECENT_MESSAGE_LIMIT) {
       const stale = this.recentMessageIds.shift();
@@ -2040,13 +2522,14 @@ export class WhatsAppControllerBridge {
     return true;
   }
 
-  rememberOutgoingMessage(messageId) {
-    if (!messageId || this.recentOutgoingSet.has(messageId)) {
+  rememberOutgoingMessage(chatId, messageId) {
+    const key = buildRecentMessageKey(chatId, messageId);
+    if (!key || this.recentOutgoingSet.has(key)) {
       return;
     }
 
-    this.recentOutgoingSet.add(messageId);
-    this.recentOutgoingIds.push(messageId);
+    this.recentOutgoingSet.add(key);
+    this.recentOutgoingIds.push(key);
 
     if (this.recentOutgoingIds.length > RECENT_MESSAGE_LIMIT) {
       const stale = this.recentOutgoingIds.shift();
@@ -2068,28 +2551,21 @@ export class WhatsAppControllerBridge {
     const remoteJid = message?.key?.remoteJid;
     const messageId = message?.key?.id ?? null;
     const fromMe = Boolean(message?.key?.fromMe);
+    const recentMessageKey = buildRecentMessageKey(remoteJid, messageId);
 
     if (!remoteJid || remoteJid.endsWith("@g.us")) {
       return;
     }
 
-    if (fromMe && this.recentOutgoingSet.has(messageId)) {
+    if (fromMe && recentMessageKey && this.recentOutgoingSet.has(recentMessageKey)) {
       return;
     }
 
-    if (!this.rememberMessage(messageId)) {
+    if (!recentMessageKey || !this.rememberMessage(recentMessageKey)) {
       return;
     }
 
     const timestamp = normalizeTimestamp(message.messageTimestamp);
-    if (
-      timestamp &&
-      this.startedAtMs &&
-      timestamp * 1000 < this.startedAtMs - 10_000
-    ) {
-      return;
-    }
-
     const config = await this.configStore.load();
     const [controller, phoneKey] = await Promise.all([
       this.configStore.findControllerByJid(remoteJid),
@@ -2107,11 +2583,28 @@ export class WhatsAppControllerBridge {
       return;
     }
 
+    const existingSession = this.getChatSession(phoneKey);
+    const lastInboundAtMs = existingSession?.lastInboundAt
+      ? Date.parse(existingSession.lastInboundAt)
+      : null;
+    if (
+      !fromMe &&
+      timestamp &&
+      Number.isFinite(lastInboundAtMs) &&
+      timestamp * 1000 <= lastInboundAtMs
+    ) {
+      return;
+    }
+
+    if (!fromMe) {
+      await this.markMessageRead(message);
+    }
+
     const messageType = extractMessageType(message.message);
     const audioMessage = extractAudioMessage(message.message);
     const extractedText = extractMessageText(message.message).trim();
     let text = audioMessage ? "" : extractedText;
-    const chatSession = this.getChatSession(phoneKey);
+      const chatSession = this.getChatSession(phoneKey);
     const activeProject = resolveConfiguredProject(
       config,
       chatSession.activeProject ?? config.defaultProject
@@ -3234,6 +3727,14 @@ export class WhatsAppControllerBridge {
       active.child.kill("SIGKILL");
     }
 
+    if (active.stallTimer) {
+      clearTimeout(active.stallTimer);
+      active.stallTimer = null;
+    }
+    if (active.stallWarningTimer) {
+      clearTimeout(active.stallWarningTimer);
+      active.stallWarningTimer = null;
+    }
     this.activeRuns.delete(runKey);
     const clearedQueued = await this.clearQueuedPrompts(phoneKey, {
       scopeType: target.targetType === "btw" ? "btw" : "project",
@@ -3333,88 +3834,115 @@ export class WhatsAppControllerBridge {
             )
           }
         : sessionVoiceReply;
+    const controllerPrompt = buildControllerRunPrompt(prompt);
     const promptForCodex = activeVoiceReply.enabled
-      ? buildVoiceReplyPrompt(prompt)
-      : prompt;
-    const { child, interrupt, answerApproval, resultPromise } = startCodexTurn({
-      codexBin: config.codexBin,
-      workspace: project.workspace,
-      prompt: promptForCodex,
-      threadId: existingThreadId,
-      threadName: existingThreadId
-        ? null
-        : buildThreadName({
-            label,
-            phoneKey,
-            projectAlias: scopeType === "project" ? project.alias : null,
-            scopeType
-          }),
-      model: project.model ?? config.model,
-      profile: project.profile ?? config.profile,
-      search: project.search ?? config.search,
-      permissionLevel,
-      onApprovalRequest: async (approval) => {
-        const currentRun = this.activeRuns.get(runKey);
-        if (!currentRun) {
-          return;
-        }
+      ? buildVoiceReplyPrompt(controllerPrompt)
+      : controllerPrompt;
+    await this.startTypingIndicator(remoteJid);
 
-        currentRun.pendingApproval = approval;
-        if (scopeType === "project") {
-          await this.upsertProjectSession(phoneKey, project.alias, {
-            projectPatch: {
-              pendingApproval: {
-                kind: approval.kind,
-                requestId: approval.requestId,
-                requestedAt: new Date().toISOString()
+    let child;
+    let interrupt;
+    let answerApproval;
+    let resultPromise;
+    try {
+      ({
+        child,
+        interrupt,
+        answerApproval,
+        resultPromise
+      } = startCodexTurn({
+        codexBin: config.codexBin,
+        workspace: project.workspace,
+        prompt: promptForCodex,
+        threadId: existingThreadId,
+        threadName: existingThreadId
+          ? null
+          : buildThreadName({
+              label,
+              phoneKey,
+              projectAlias: scopeType === "project" ? project.alias : null,
+              scopeType
+            }),
+        model: project.model ?? config.model,
+        profile: project.profile ?? config.profile,
+        search: project.search ?? config.search,
+        permissionLevel,
+        onApprovalRequest: async (approval) => {
+          const currentRun = this.activeRuns.get(runKey);
+          if (!currentRun) {
+            return;
+          }
+
+          currentRun.pendingApproval = approval;
+          if (scopeType === "project") {
+            await this.upsertProjectSession(phoneKey, project.alias, {
+              projectPatch: {
+                pendingApproval: {
+                  kind: approval.kind,
+                  requestId: approval.requestId,
+                  requestedAt: new Date().toISOString()
+                }
               }
-            }
-          });
-        }
-        await this.sendReply(
-          remoteJid,
-          [
-            scopeType === "btw"
-              ? `Approval needed for btw session ${shortThreadId(approval.threadId ?? existingThreadId)}.`
-              : `Approval needed for project ${project.alias} session ${shortThreadId(
-                  approval.threadId ?? existingThreadId
-                )}.`,
-            "",
-            formatApprovalDetails(approval)
-          ].join("\n")
-        );
-      },
-      onApprovalResolved: async () => {
-        const currentRun = this.activeRuns.get(runKey);
-        if (!currentRun) {
-          return;
-        }
+            });
+          }
+          await this.sendReply(
+            remoteJid,
+            [
+              scopeType === "btw"
+                ? `Approval needed for btw session ${shortThreadId(approval.threadId ?? existingThreadId)}.`
+                : `Approval needed for project ${project.alias} session ${shortThreadId(
+                    approval.threadId ?? existingThreadId
+                  )}.`,
+              "",
+              formatApprovalDetails(approval)
+            ].join("\n")
+          );
+        },
+        onApprovalResolved: async () => {
+          const currentRun = this.activeRuns.get(runKey);
+          if (!currentRun) {
+            return;
+          }
 
-        currentRun.pendingApproval = null;
-        if (scopeType === "project") {
-          await this.upsertProjectSession(phoneKey, project.alias, {
-            projectPatch: {
-              pendingApproval: null
-            }
-          });
-        }
-      },
-      onLifecycleEvent: (event) => {
-        const currentRun = this.activeRuns.get(runKey);
-        if (!currentRun) {
-          return;
-        }
+          currentRun.pendingApproval = null;
+          if (scopeType === "project") {
+            await this.upsertProjectSession(phoneKey, project.alias, {
+              projectPatch: {
+                pendingApproval: null
+              }
+            });
+          }
+        },
+        onLifecycleEvent: (event) => {
+          const currentRun = this.activeRuns.get(runKey);
+          if (!currentRun) {
+            return;
+          }
 
-        applyRunLifecycleEvent(currentRun, event);
-      }
-    });
+          applyRunLifecycleEvent(currentRun, event);
+          this.resetRunStallTimer(runKey);
+          this.maybeSendRunProgressUpdate({
+            phoneKey,
+            remoteJid,
+            scopeType,
+            projectAlias: project.alias,
+            activeRun: currentRun
+          }).catch(() => {});
+        }
+      }));
+    } catch (error) {
+      await this.stopTypingIndicator(remoteJid);
+      throw error;
+    }
 
     const activeRun = {
       child,
       interrupt,
       answerApproval,
       threadId: existingThreadId,
+      remoteJid,
       startedAt: new Date().toISOString(),
+      startedAtMs: Date.now(),
       cancelled: false,
       pendingApproval: null,
       status: "starting",
@@ -3422,11 +3950,29 @@ export class WhatsAppControllerBridge {
       lastProgressAt: null,
       progressPhase: null,
       progressPreview: null,
+      lastProgressSentAt: null,
+      lastProgressSentPreview: null,
+      sendingProgressUpdate: false,
+      isBulkRun: looksLikeBulkOperationPrompt(prompt),
+      stallTimeoutMs: looksLikeBulkOperationPrompt(prompt)
+        ? BULK_RUN_STALL_TIMEOUT_MS
+        : RUN_STALL_TIMEOUT_MS,
+      progressDelayMs: looksLikeBulkOperationPrompt(prompt)
+        ? BULK_RUN_PROGRESS_DELAY_MS
+        : LONG_RUN_PROGRESS_DELAY_MS,
+      stallTimer: null,
+      stallWarningTimer: null,
+      stallWarningSent: false,
+      stallExtensionCount: 0,
+      timedOut: false,
+      activeToolItems: new Map(),
+      toolWaitStartedAt: null,
       voiceReply: cloneVoiceReplySetting(activeVoiceReply),
       scopeType,
       projectAlias: scopeType === "project" ? project.alias : null
     };
     this.activeRuns.set(runKey, activeRun);
+    this.resetRunStallTimer(runKey);
     const activeProjectAtDispatch = this.getActiveProject(phoneKey);
 
     if (scopeType === "project") {
@@ -3457,23 +4003,17 @@ export class WhatsAppControllerBridge {
       });
     }
 
-    await this.sendReply(
-      remoteJid,
-      joinMessageSections(
-        statusPrelude,
-        scopeType === "btw"
-          ? "Starting a disposable btw Codex session. I will answer here and then return to your current project."
-          : project.alias !== activeProjectAtDispatch.alias
-            ? `Started a one-off run in ${project.alias}. You are still in ${activeProjectAtDispatch.alias}. I will post the result here when it completes.`
-            : existingThreadId
-              ? `Working in ${project.alias} session ${shortThreadId(existingThreadId)} with ${permissionLevel} permissions. I will post the result here when it completes.`
-              : `Starting a fresh Codex session in ${project.alias} with ${permissionLevel} permissions. I will post the result here when it completes.`
-      )
-    );
-
     try {
       const result = await resultPromise;
       this.activeRuns.delete(runKey);
+      if (activeRun.stallTimer) {
+        clearTimeout(activeRun.stallTimer);
+        activeRun.stallTimer = null;
+      }
+      if (activeRun.stallWarningTimer) {
+        clearTimeout(activeRun.stallWarningTimer);
+        activeRun.stallWarningTimer = null;
+      }
       const currentVoiceReply = resolveRunVoiceReply(activeRun, activeVoiceReply);
       const replyEnvelope = extractVoiceReplyEnvelope(result.replyText);
       const replyText =
@@ -3588,9 +4128,21 @@ export class WhatsAppControllerBridge {
       });
     } catch (error) {
       this.activeRuns.delete(runKey);
+      if (activeRun.stallTimer) {
+        clearTimeout(activeRun.stallTimer);
+        activeRun.stallTimer = null;
+      }
+      if (activeRun.stallWarningTimer) {
+        clearTimeout(activeRun.stallWarningTimer);
+        activeRun.stallWarningTimer = null;
+      }
       if (activeRun.cancelled) {
         return;
       }
+
+      const failureMessage = activeRun.timedOut
+        ? "Codex run stalled while waiting for a tool response and was stopped."
+        : sanitizeErrorTextForWhatsApp(error?.message);
 
       if (scopeType === "project") {
         await this.upsertProjectSession(phoneKey, project.alias, {
@@ -3602,7 +4154,7 @@ export class WhatsAppControllerBridge {
           projectPatch: {
             pendingApproval: null,
             lastErrorAt: new Date().toISOString(),
-            lastError: error.message
+            lastError: failureMessage
           }
         });
       }
@@ -3610,7 +4162,7 @@ export class WhatsAppControllerBridge {
       await this.sendReply(
         remoteJid,
         scopeType === "btw"
-          ? `Codex btw run failed: ${error.message}`
+          ? `Codex btw run failed: ${failureMessage}`
           : joinMessageSections(
               formatProjectRunReplyPrefix({
                 projectAlias: project.alias,
@@ -3618,7 +4170,7 @@ export class WhatsAppControllerBridge {
                 activeProjectAlias: this.getActiveProject(phoneKey).alias,
                 outcome: "failed"
               }),
-              error.message
+              failureMessage
             )
       );
       await this.runNextQueuedPrompt({
@@ -3628,7 +4180,120 @@ export class WhatsAppControllerBridge {
         scopeType,
         projectAlias: project.alias
       });
+    } finally {
+      await this.stopTypingIndicator(remoteJid);
     }
+  }
+
+  async markMessageRead(message) {
+    const key = message?.key;
+    if (!key?.remoteJid || !key?.id) {
+      return;
+    }
+
+    try {
+      const timestamp = normalizeTimestamp(message?.messageTimestamp);
+      const lastMessage = {
+        key: {
+          remoteJid: key.remoteJid,
+          id: key.id,
+          fromMe: Boolean(key.fromMe),
+          ...(key.participant ? { participant: key.participant } : {})
+        },
+        ...(timestamp ? { messageTimestamp: timestamp } : {})
+      };
+
+      await this.withSendRetry(async () => {
+        const socket = await this.runtime.ensureConnected(SEND_RETRY_CONNECT_TIMEOUT_MS);
+        await socket.readMessages([
+          {
+            remoteJid: key.remoteJid,
+            id: key.id,
+            fromMe: Boolean(key.fromMe),
+            ...(key.participant ? { participant: key.participant } : {})
+          }
+        ]);
+        await socket.chatModify(
+          {
+            markRead: true,
+            lastMessages: [lastMessage]
+          },
+          key.remoteJid
+        );
+      });
+    } catch {
+      // Ignore read-receipt failures so message handling still continues.
+    }
+  }
+
+  async startTypingIndicator(remoteJid) {
+    const existing = this.activePresence.get(remoteJid);
+    if (existing) {
+      existing.refs += 1;
+      return;
+    }
+
+    const tick = async () => {
+      try {
+        const socket = await this.runtime.ensureConnected();
+        await socket.sendPresenceUpdate("composing", remoteJid);
+      } catch {
+        // Presence updates are best-effort only.
+      }
+    };
+
+    const interval = setInterval(() => {
+      tick().catch(() => {});
+    }, 10_000);
+
+    this.activePresence.set(remoteJid, {
+      refs: 1,
+      interval
+    });
+
+    await tick();
+  }
+
+  async stopTypingIndicator(remoteJid) {
+    const existing = this.activePresence.get(remoteJid);
+    if (!existing) {
+      return;
+    }
+
+    existing.refs -= 1;
+    if (existing.refs > 0) {
+      return;
+    }
+
+    clearInterval(existing.interval);
+    this.activePresence.delete(remoteJid);
+
+    try {
+      const socket = await this.runtime.ensureConnected();
+      await socket.sendPresenceUpdate("paused", remoteJid);
+    } catch {
+      // Presence updates are best-effort only.
+    }
+  }
+
+  async withSendRetry(operation) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= SEND_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableSendDisconnectError(error) || attempt >= SEND_RETRY_ATTEMPTS) {
+          throw error;
+        }
+
+        await delay(SEND_RETRY_BASE_DELAY_MS * attempt);
+        await this.runtime.ensureConnected(SEND_RETRY_CONNECT_TIMEOUT_MS).catch(() => {});
+      }
+    }
+
+    throw lastError ?? new Error("WhatsApp send failed.");
   }
 
   async sendReply(remoteJid, text) {
@@ -3648,16 +4313,16 @@ export class WhatsAppControllerBridge {
   }
 
   async sendTextMessage(chatId, text) {
-    const socket = await this.runtime.ensureConnected();
-
     for (const part of splitMessage(text)) {
-      const sent = await socket.sendMessage(chatId, { text: part });
-      this.rememberOutgoingMessage(sent?.key?.id ?? null);
+      const sent = await this.withSendRetry(async () => {
+        const socket = await this.runtime.ensureConnected(SEND_RETRY_CONNECT_TIMEOUT_MS);
+        return socket.sendMessage(chatId, { text: part });
+      });
+      this.rememberOutgoingMessage(chatId, sent?.key?.id ?? null);
     }
   }
 
   async sendVoiceNoteMessage(chatId, audioBuffer, { mimetype, seconds } = {}) {
-    const socket = await this.runtime.ensureConnected();
     const content = {
       audio: Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer ?? ""),
       ptt: true,
@@ -3668,7 +4333,10 @@ export class WhatsAppControllerBridge {
       content.seconds = seconds;
     }
 
-    const sent = await socket.sendMessage(chatId, content);
-    this.rememberOutgoingMessage(sent?.key?.id ?? null);
+    const sent = await this.withSendRetry(async () => {
+      const socket = await this.runtime.ensureConnected(SEND_RETRY_CONNECT_TIMEOUT_MS);
+      return socket.sendMessage(chatId, content);
+    });
+    this.rememberOutgoingMessage(chatId, sent?.key?.id ?? null);
   }
 }

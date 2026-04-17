@@ -1,10 +1,15 @@
 node_modules/
 plugins/whatsapp-relay/.venv-chatterbox/
+.codex/
+controller-owner.json
+package-lock.json
 
 plugins/whatsapp-relay/data/auth*/
+plugins/whatsapp-relay/data/auth-qr.*
 plugins/whatsapp-relay/data/controller-config.json
 plugins/whatsapp-relay/data/controller-state.json
 plugins/whatsapp-relay/data/controller.log
+plugins/whatsapp-relay/data/*.log
 plugins/whatsapp-relay/data/controller-outbox/
 plugins/whatsapp-relay/data/controller-outbox.failed/
 plugins/whatsapp-relay/data/store.json

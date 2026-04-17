@@ -8,6 +8,7 @@ import { getGlobalControllerOwner } from "./controller-owner.mjs";
 import { ControllerStateStore } from "./controller-state.mjs";
 import {
   controllerDaemonScript,
+  controllerDaemonLauncherScript,
   controllerLogFile,
   repoRoot
 } from "./paths.mjs";
@@ -67,21 +68,42 @@ export async function startControllerDaemon() {
 
   const configStore = new ControllerConfigStore();
   const config = await configStore.load();
-  const logHandle = await fs.open(controllerLogFile, "a");
-  const child = spawn(process.execPath, [controllerDaemonScript], {
-    cwd: repoRoot,
-    detached: true,
-    env: controllerDaemonEnv(config),
-    stdio: ["ignore", logHandle.fd, logHandle.fd]
-  });
-
-  child.unref();
-  await logHandle.close();
+  let child;
+  if (process.platform === "win32") {
+    child = spawn(
+      "wscript.exe",
+      [
+        controllerDaemonLauncherScript,
+        process.execPath,
+        controllerDaemonScript,
+        controllerLogFile
+      ],
+      {
+        cwd: repoRoot,
+        detached: true,
+        env: controllerDaemonEnv(config),
+        stdio: "ignore",
+        windowsHide: true
+      }
+    );
+    child.unref();
+  } else {
+    const logHandle = await fs.open(controllerLogFile, "a");
+    child = spawn(process.execPath, [controllerDaemonScript], {
+      cwd: repoRoot,
+      detached: true,
+      env: controllerDaemonEnv(config),
+      stdio: ["ignore", logHandle.fd, logHandle.fd],
+      windowsHide: true
+    });
+    child.unref();
+    await logHandle.close();
+  }
 
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await delay(250);
     const status = await getControllerProcessStatus();
-    if (status.running && status.pid === child.pid) {
+    if (status.running && (process.platform === "win32" || status.pid === child.pid)) {
       return status;
     }
   }

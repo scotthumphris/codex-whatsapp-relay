@@ -34,6 +34,18 @@ const VOICE_COMMAND_INTENT_MODEL = "gpt-5.4-mini";
 const VOICE_COMMAND_INTENT_REASONING_EFFORT = "low";
 const PROJECT_INTENT_MODEL = "gpt-5.4-mini";
 const PROJECT_INTENT_REASONING_EFFORT = "low";
+const FINAL_ANSWER_COMPLETION_GRACE_MS = 15_000;
+const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g;
+const HTML_TAG_PATTERN = /<[^>]+>/i;
+const OPAQUE_TOKEN_PATTERN = /[A-Za-z0-9._-]{120,}/;
+const NOISY_ERROR_PATTERNS = [
+  /failed to warm featured plugin ids cache/i,
+  /codex_core::plugins::/i,
+  /interface\.defaultPrompt/i,
+  /enable javascript and cookies to continue/i,
+  /backend-api\/plugins\/featured/i,
+  /cloudflare/i
+];
 
 const VOICE_COMMAND_INTENT_SCHEMA = {
   type: "object",
@@ -358,7 +370,11 @@ export function normalizeCodexTurnNotification(
 
   switch (method) {
     case "item/started":
-      if (params.turnId === activeTurnId && params.item?.type === "agentMessage") {
+      if (params.turnId !== activeTurnId || !params.item?.id) {
+        return null;
+      }
+
+      if (params.item.type === "agentMessage") {
         return {
           type: "agentMessageStarted",
           turnId: params.turnId,
@@ -367,7 +383,19 @@ export function normalizeCodexTurnNotification(
           text: params.item.text ?? ""
         };
       }
-      return null;
+
+      return {
+        type: "itemStarted",
+        turnId: params.turnId,
+        itemId: params.item.id,
+        itemType: params.item.type ?? null,
+        title:
+          params.item.title ??
+          params.item.command ??
+          params.item.name ??
+          params.item.label ??
+          null
+      };
     case "item/agentMessage/delta":
       if (params.turnId === activeTurnId) {
         return {
@@ -379,7 +407,11 @@ export function normalizeCodexTurnNotification(
       }
       return null;
     case "item/completed":
-      if (params.turnId === activeTurnId && params.item?.type === "agentMessage") {
+      if (params.turnId !== activeTurnId || !params.item?.id) {
+        return null;
+      }
+
+      if (params.item.type === "agentMessage") {
         return {
           type: "agentMessageCompleted",
           turnId: params.turnId,
@@ -388,7 +420,19 @@ export function normalizeCodexTurnNotification(
           text: params.item.text ?? ""
         };
       }
-      return null;
+
+      return {
+        type: "itemCompleted",
+        turnId: params.turnId,
+        itemId: params.item.id,
+        itemType: params.item.type ?? null,
+        title:
+          params.item.title ??
+          params.item.command ??
+          params.item.name ??
+          params.item.label ??
+          null
+      };
     case "serverRequest/resolved":
       if (params.threadId === resolvedThreadId && params.requestId !== undefined) {
         return {
@@ -430,6 +474,44 @@ function formatRequestError(message = "Unknown app-server error.") {
   return new Error(message);
 }
 
+function summarizeUserFacingErrorText(
+  text,
+  fallback = "Codex app-server exited unexpectedly before completing the run."
+) {
+  const normalized = String(text ?? "")
+    .replace(ANSI_ESCAPE_PATTERN, "")
+    .replace(/\r/g, "")
+    .trim();
+  if (!normalized) {
+    return fallback;
+  }
+
+  if (
+    HTML_TAG_PATTERN.test(normalized) ||
+    OPAQUE_TOKEN_PATTERN.test(normalized) ||
+    NOISY_ERROR_PATTERNS.some((pattern) => pattern.test(normalized))
+  ) {
+    return fallback;
+  }
+
+  const candidate = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter(
+      (line) =>
+        !HTML_TAG_PATTERN.test(line) &&
+        !OPAQUE_TOKEN_PATTERN.test(line) &&
+        !NOISY_ERROR_PATTERNS.some((pattern) => pattern.test(line))
+    )
+    .slice(0, 3)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return candidate || fallback;
+}
+
 function formatTurnError(turnError) {
   if (!turnError) {
     return new Error("Codex turn failed.");
@@ -440,15 +522,20 @@ function formatTurnError(turnError) {
     parts.push(turnError.additionalDetails);
   }
 
-  return new Error(parts.filter(Boolean).join("\n\n") || "Codex turn failed.");
+  return new Error(
+    summarizeUserFacingErrorText(
+      parts.filter(Boolean).join("\n\n"),
+      "Codex turn failed."
+    )
+  );
 }
 
 function formatCloseError({ code, signal, stderr }) {
+  const fallback = signal
+    ? `Codex app-server exited with signal ${signal}.`
+    : `Codex app-server exited with code ${code}.`;
   return new Error(
-    stderr.trim() ||
-      (signal
-        ? `Codex app-server exited with signal ${signal}.`
-        : `Codex app-server exited with code ${code}.`)
+    summarizeUserFacingErrorText(stderr, fallback)
   );
 }
 
@@ -947,6 +1034,7 @@ export function startCodexTurn({
   let settled = false;
   let fallbackReply = "";
   let finalReply = "";
+  let finalAnswerCompletionTimer = null;
 
   const agentMessages = new Map();
 
@@ -963,11 +1051,37 @@ export function startCodexTurn({
     }
 
     settled = true;
+    if (finalAnswerCompletionTimer) {
+      clearTimeout(finalAnswerCompletionTimer);
+      finalAnswerCompletionTimer = null;
+    }
     if (type === "resolve") {
       resolveResult(value);
     } else {
       rejectResult(value);
     }
+  }
+
+  function scheduleFinalAnswerFallback() {
+    if (settled || !finalReply.trim()) {
+      return;
+    }
+
+    if (finalAnswerCompletionTimer) {
+      clearTimeout(finalAnswerCompletionTimer);
+    }
+
+    finalAnswerCompletionTimer = setTimeout(() => {
+      if (settled || !finalReply.trim()) {
+        return;
+      }
+
+      settle("resolve", {
+        threadId: resolvedThreadId,
+        replyText: finalReply || fallbackReply || "Codex completed without a final message."
+      });
+      client.shutdown().catch(() => {});
+    }, FINAL_ANSWER_COMPLETION_GRACE_MS);
   }
 
   function handleAgentMessage(item) {
@@ -987,6 +1101,7 @@ export function startCodexTurn({
 
     if (item.phase === "final_answer" && text.trim()) {
       finalReply = text;
+      scheduleFinalAnswerFallback();
     }
   }
 
@@ -1005,6 +1120,13 @@ export function startCodexTurn({
           phase: event.phase ?? null,
           text: event.text ?? ""
         });
+        if (event.phase === "final_answer" && event.text?.trim()) {
+          handleAgentMessage({
+            id: event.itemId,
+            phase: event.phase,
+            text: event.text
+          });
+        }
         onLifecycleEvent?.(event);
         return;
       case "agentMessageDelta": {
@@ -1014,6 +1136,13 @@ export function startCodexTurn({
         };
         current.text += event.delta;
         agentMessages.set(event.itemId, current);
+        if (current.phase === "final_answer" && current.text.trim()) {
+          handleAgentMessage({
+            id: event.itemId,
+            phase: current.phase,
+            text: current.text
+          });
+        }
         onLifecycleEvent?.({
           ...event,
           phase: current.phase ?? null,

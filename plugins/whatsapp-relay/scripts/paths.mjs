@@ -16,6 +16,7 @@ export const controllerLogFile = path.join(dataDir, "controller.log");
 export const controllerOutboxDir = path.join(dataDir, "controller-outbox");
 export const controllerOutboxFailedDir = path.join(dataDir, "controller-outbox.failed");
 export const controllerDaemonScript = path.join(scriptDir, "controller-daemon.mjs");
+export const controllerDaemonLauncherScript = path.join(scriptDir, "controller-daemon-launcher.vbs");
 export const globalControllerOwnerFile = path.join(
   process.env.HOME ?? repoRoot,
   ".codex",

@@ -205,6 +205,56 @@ test("normalizeCodexTurnNotification normalizes matching agent and turn events",
   );
 });
 
+test("normalizeCodexTurnNotification surfaces non-message item lifecycle events", () => {
+  assert.deepEqual(
+    normalizeCodexTurnNotification(
+      {
+        method: "item/started",
+        params: {
+          turnId: "turn-1",
+          item: {
+            type: "functionCall",
+            id: "tool-1",
+            title: "gmail_bulk_label_matching_emails"
+          }
+        }
+      },
+      { activeTurnId: "turn-1", resolvedThreadId: "thread-1" }
+    ),
+    {
+      type: "itemStarted",
+      turnId: "turn-1",
+      itemId: "tool-1",
+      itemType: "functionCall",
+      title: "gmail_bulk_label_matching_emails"
+    }
+  );
+
+  assert.deepEqual(
+    normalizeCodexTurnNotification(
+      {
+        method: "item/completed",
+        params: {
+          turnId: "turn-1",
+          item: {
+            type: "functionCall",
+            id: "tool-1",
+            title: "gmail_bulk_label_matching_emails"
+          }
+        }
+      },
+      { activeTurnId: "turn-1", resolvedThreadId: "thread-1" }
+    ),
+    {
+      type: "itemCompleted",
+      turnId: "turn-1",
+      itemId: "tool-1",
+      itemType: "functionCall",
+      title: "gmail_bulk_label_matching_emails"
+    }
+  );
+});
+
 test("normalizeCodexTurnNotification ignores unrelated turns and threads", () => {
   assert.equal(
     normalizeCodexTurnNotification(
